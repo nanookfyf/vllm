@@ -13,6 +13,7 @@ from vllm.distributed import (
     sched_yield,
     stateless_destroy_torch_distributed_process_group,
 )
+from vllm.distributed.elastic_ep.profile import get_eep_profile
 from vllm.logger import init_logger
 from vllm.v1.engine import (
     EEPNotificationType,
@@ -309,34 +310,37 @@ class ElasticEPScalingState:
     def _progress_new_engine(self) -> bool:
         state = self.state
         assert self.new_dp_group is not None and self.new_dp_store is not None
+        profiler = get_eep_profile(rank=self.new_dp_group.rank())
 
         if state == ScaleUpNewEngineState.PRE_KV_INIT:
-            self.engine_core._eep_send_engine_core_notification(
-                EEPNotificationType.NEW_CORE_ENGINES_WEIGHTS_INIT_READY
-            )
-            self.model_executor.collective_rpc(
-                "elastic_ep_execute", args=("receive_weights",)
-            )
-            self.engine_core.available_gpu_memory_for_kv_cache = (
-                ParallelConfig.sync_kv_cache_memory_size(self.new_dp_group, -1)
-            )
-            self.model_executor.collective_rpc(
-                "elastic_ep_execute", args=("prepare_new_worker",)
-            )
+            with profiler.track("_progress_new_engine", "PRE_KV_INIT"):
+                self.engine_core._eep_send_engine_core_notification(
+                    EEPNotificationType.NEW_CORE_ENGINES_WEIGHTS_INIT_READY
+                )
+                self.model_executor.collective_rpc(
+                    "elastic_ep_execute", args=("receive_weights",)
+                )
+                self.engine_core.available_gpu_memory_for_kv_cache = (
+                    ParallelConfig.sync_kv_cache_memory_size(self.new_dp_group, -1)
+                )
+                self.model_executor.collective_rpc(
+                    "elastic_ep_execute", args=("prepare_new_worker",)
+                )
             self.state = ScaleUpNewEngineState.PREPARE
             return True
 
         elif state == ScaleUpNewEngineState.PREPARE:
-            tensor = torch.tensor([0, 0, 0], dtype=torch.int32, device="cpu")
-            torch.distributed.all_reduce(
-                tensor,
-                op=torch.distributed.ReduceOp.MAX,
-                group=self.new_dp_group,
-            )
-            data = tensor.tolist()
-            self.engine_core.engines_running = bool(data[0])
-            self.engine_core.current_wave = int(data[1])
-            self.engine_core.step_counter = int(data[2])
+            with profiler.track("_progress_new_engine", "PREPARE"):
+                tensor = torch.tensor([0, 0, 0], dtype=torch.int32, device="cpu")
+                torch.distributed.all_reduce(
+                    tensor,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=self.new_dp_group,
+                )
+                data = tensor.tolist()
+                self.engine_core.engines_running = bool(data[0])
+                self.engine_core.current_wave = int(data[1])
+                self.engine_core.step_counter = int(data[2])
             self.state = ScaleUpNewEngineState.EPLB_RESHUFFLE
             self.new_dp_store.add("eep_barrier_engine_count", 1)
             return True
@@ -352,7 +356,8 @@ class ElasticEPScalingState:
             ):
                 return False
             assert self.new_dp_group.rank() > 0
-            self._eplb_reshuffle()
+            with profiler.track("_progress_new_engine", "EPLB_RESHUFFLE"):
+                self._eplb_reshuffle()
             self.state = ScaleUpNewEngineState.COMPLETE
             return True
 
@@ -363,6 +368,7 @@ class ElasticEPScalingState:
     def _progress_remaining_engine(self) -> bool:
         state = self.state
         assert self.old_dp_group is not None and self.old_dp_store is not None
+        profiler = get_eep_profile(rank=self.old_dp_group.rank())
 
         if state == ScaleDownRemainingEngineState.PREPARE:
             self.state = ScaleDownRemainingEngineState.EPLB_RESHUFFLE
@@ -381,7 +387,10 @@ class ElasticEPScalingState:
                 return False
             if self.old_dp_group.rank() == 0:
                 self.old_dp_store.delete_key("eep_barrier_engine_count")
-            self._eplb_reshuffle_before_scale_down()
+            with profiler.track(
+                "_progress_remaining_engine", "EPLB_RESHUFFLE"
+            ):
+                self._eplb_reshuffle_before_scale_down()
             self.state = ScaleDownRemainingEngineState.SWITCH_AND_PREPARE
             # NOTE(yongji): currently, after EPLB reshuffle
             # that redistributes experts to remaining workers, workers
@@ -390,9 +399,10 @@ class ElasticEPScalingState:
             # the old setup. In the future, we may keep
             # the removing workers alive a bit longer,
             # e.g., to drain in-batch requests.
-            self._create_standby_groups()
-            self._switch_and_prepare()
-            self._update_parallel_config()
+            with profiler.track("_progress_remaining_engine", "SWITCH_AND_PREPARE"):
+                self._create_standby_groups()
+                self._switch_and_prepare()
+                self._update_parallel_config()
             self.state = ScaleDownRemainingEngineState.COMPLETE
             return True
 
@@ -403,6 +413,7 @@ class ElasticEPScalingState:
     def _progress_removing_engine(self) -> bool:
         state = self.state
         assert self.old_dp_group is not None and self.old_dp_store is not None
+        profiler = get_eep_profile(rank=self.old_dp_group.rank())
 
         if state == ScaleDownRemovingEngineState.PREPARE:
             self.state = ScaleDownRemovingEngineState.EPLB_RESHUFFLE
@@ -420,8 +431,10 @@ class ElasticEPScalingState:
             ):
                 return False
             assert self.old_dp_group.rank() > 0
-            self._eplb_reshuffle_before_scale_down()
-            self._switch_and_remove()
+            with profiler.track("_progress_removing_engine", "EPLB_RESHUFFLE"):
+                self._eplb_reshuffle_before_scale_down()
+            with profiler.track("_progress_removing_engine", "SWITCH_AND_REMOVE"):
+                self._switch_and_remove()
             self.state = ScaleDownRemovingEngineState.COMPLETE
             self.engine_core._eep_send_engine_core_notification(
                 EEPNotificationType.SHUTDOWN_COMPLETE
@@ -464,12 +477,15 @@ class ElasticEPScalingState:
 
     def _create_standby_groups(self):
         assert self.old_dp_group is not None
-        self.new_dp_group, self.new_dp_store = (
-            self.new_parallel_config.stateless_init_dp_group(return_store=True)
-        )
-        self.model_executor.collective_rpc(
-            "elastic_ep_execute", args=("create_standby_groups", self.reconfig_request)
-        )
+        profiler = get_eep_profile(rank=self.old_dp_group.rank())
+        with profiler.track("_create_standby_groups", "init_dp_group_and_rpc"):
+            self.new_dp_group, self.new_dp_store = (
+                self.new_parallel_config.stateless_init_dp_group(return_store=True)
+            )
+            self.model_executor.collective_rpc(
+                "elastic_ep_execute",
+                args=("create_standby_groups", self.reconfig_request),
+            )
         if self.old_dp_group.rank() == 0:
             logger.info("[Elastic EP] Created standby communication groups")
 
@@ -477,80 +493,94 @@ class ElasticEPScalingState:
         assert self.reconfig_request is not None and self.old_dp_group is not None
         old_dp_size = self.old_dp_group.size()
         new_dp_size = self.reconfig_request.new_data_parallel_size
-
-        self.model_executor.collective_rpc(
-            "elastic_ep_execute", args=("transfer_weights", old_dp_size, new_dp_size)
-        )
+        profiler = get_eep_profile(rank=self.old_dp_group.rank())
+        with profiler.track("_transfer_weights", ""):
+            self.model_executor.collective_rpc(
+                "elastic_ep_execute",
+                args=("transfer_weights", old_dp_size, new_dp_size),
+            )
         if self.old_dp_group.rank() == 0:
             logger.info("[Elastic EP] Transferred weights to new workers")
 
     def _transfer_expert_mapping(self):
         assert self.old_dp_group is not None
-        self.model_executor.collective_rpc(
-            "elastic_ep_execute", args=("broadcast_expert_mapping",)
-        )
+        profiler = get_eep_profile(rank=self.old_dp_group.rank())
+        with profiler.track("_transfer_expert_mapping", ""):
+            self.model_executor.collective_rpc(
+                "elastic_ep_execute", args=("broadcast_expert_mapping",)
+            )
         if self.old_dp_group.rank() == 0:
             logger.info("[Elastic EP] Broadcasted expert mapping to new workers")
 
     def _sync_kv_cache_memory_size(self):
         assert self.engine_core.available_gpu_memory_for_kv_cache > 0
         assert self.new_dp_group is not None and self.old_dp_group is not None
-        ParallelConfig.sync_kv_cache_memory_size(
-            self.new_dp_group,
-            self.engine_core.available_gpu_memory_for_kv_cache,
-        )
+        profiler = get_eep_profile(rank=self.old_dp_group.rank())
+        with profiler.track("_sync_kv_cache_memory_size", ""):
+            ParallelConfig.sync_kv_cache_memory_size(
+                self.new_dp_group,
+                self.engine_core.available_gpu_memory_for_kv_cache,
+            )
         if self.old_dp_group.rank() == 0:
             logger.info("[Elastic EP] Synced KV cache memory size to new workers")
 
     def _switch_and_prepare(self):
-        self.model_executor.collective_rpc(
-            "elastic_ep_execute", args=("switch_and_prepare",)
-        )
         old_dp_group = self.old_dp_group
+        rank = old_dp_group.rank() if old_dp_group is not None else None
+        profiler = get_eep_profile(rank=rank)
+        with profiler.track("_switch_and_prepare", "switch_and_prepare_rpc"):
+            self.model_executor.collective_rpc(
+                "elastic_ep_execute", args=("switch_and_prepare",)
+            )
         stateless_destroy_torch_distributed_process_group(old_dp_group)
         assert self.new_dp_group is not None
         new_dp_group = self.new_dp_group
-        self.engine_core.dp_group = new_dp_group
-        self.engine_core.dp_rank = new_dp_group.rank()
-        self.engine_core.dp_store = self.new_dp_store
-        engines_running = int(self.engine_core.engines_running)
-        current_wave = self.engine_core.current_wave
-        step_counter = self.engine_core.step_counter
-        tensor = torch.tensor(
-            [engines_running, current_wave, step_counter],
-            dtype=torch.int32,
-            device="cpu",
-        )
-        torch.distributed.all_reduce(
-            tensor, op=torch.distributed.ReduceOp.MAX, group=new_dp_group
-        )
-        data = tensor.tolist()
-        self.engine_core.engines_running = bool(data[0])
-        self.engine_core.current_wave = int(data[1])
-        self.engine_core.step_counter = int(data[2])
-        if new_dp_group.rank() == 0:
-            self.engine_core._eep_send_engine_core_notification(
-                EEPNotificationType.RECONFIGURE_FINISHED
+        with profiler.track("_switch_and_prepare", "sync_state"):
+            self.engine_core.dp_group = new_dp_group
+            self.engine_core.dp_rank = new_dp_group.rank()
+            self.engine_core.dp_store = self.new_dp_store
+            engines_running = int(self.engine_core.engines_running)
+            current_wave = self.engine_core.current_wave
+            step_counter = self.engine_core.step_counter
+            tensor = torch.tensor(
+                [engines_running, current_wave, step_counter],
+                dtype=torch.int32,
+                device="cpu",
             )
-            logger.info("[Elastic EP] Switched to new setup")
+            torch.distributed.all_reduce(
+                tensor, op=torch.distributed.ReduceOp.MAX, group=new_dp_group
+            )
+            data = tensor.tolist()
+            self.engine_core.engines_running = bool(data[0])
+            self.engine_core.current_wave = int(data[1])
+            self.engine_core.step_counter = int(data[2])
+            if new_dp_group.rank() == 0:
+                self.engine_core._eep_send_engine_core_notification(
+                    EEPNotificationType.RECONFIGURE_FINISHED
+                )
+                logger.info("[Elastic EP] Switched to new setup")
 
     def _eplb_reshuffle(self):
-        self.model_executor.collective_rpc(
-            "elastic_ep_execute", args=("perform_eplb_reshuffle",)
-        )
         assert self.new_dp_group is not None
+        profiler = get_eep_profile(rank=self.new_dp_group.rank())
+        with profiler.track("_eplb_reshuffle", ""):
+            self.model_executor.collective_rpc(
+                "elastic_ep_execute", args=("perform_eplb_reshuffle",)
+            )
         if self.new_dp_group.rank() == 0:
             logger.info("[Elastic EP] EPLB reshuffle completed")
 
     def _eplb_reshuffle_before_scale_down(self):
         assert self.reconfig_request is not None and self.old_dp_group is not None
-        self.model_executor.collective_rpc(
-            "elastic_ep_execute",
-            args=(
-                "perform_scale_down_eplb_reshuffle",
-                self.reconfig_request.new_data_parallel_size,
-            ),
-        )
+        profiler = get_eep_profile(rank=self.old_dp_group.rank())
+        with profiler.track("_eplb_reshuffle_before_scale_down", ""):
+            self.model_executor.collective_rpc(
+                "elastic_ep_execute",
+                args=(
+                    "perform_scale_down_eplb_reshuffle",
+                    self.reconfig_request.new_data_parallel_size,
+                ),
+            )
         if self.old_dp_group.rank() == 0:
             logger.info("[Elastic EP] EPLB reshuffle completed")
 

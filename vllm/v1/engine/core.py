@@ -22,6 +22,7 @@ import zmq
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
+from vllm.distributed.elastic_ep.profile import get_eep_profile
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
@@ -1773,46 +1774,51 @@ class DPEngineCoreProc(EngineCoreProc):
 
         from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState
 
-        new_parallel_config = deepcopy(self.vllm_config.parallel_config)
-        old_dp_size = new_parallel_config.data_parallel_size
-        new_parallel_config.data_parallel_size = reconfig_request.new_data_parallel_size
-        if (
-            reconfig_request.new_data_parallel_rank
-            != ReconfigureRankType.KEEP_CURRENT_RANK
-        ):
-            new_parallel_config.data_parallel_rank = (
-                reconfig_request.new_data_parallel_rank
+        profiler = get_eep_profile(rank=self.dp_rank)
+        with profiler.track("reinitialize_distributed", "total"):
+            new_parallel_config = deepcopy(self.vllm_config.parallel_config)
+            old_dp_size = new_parallel_config.data_parallel_size
+            new_parallel_config.data_parallel_size = (
+                reconfig_request.new_data_parallel_size
             )
-        new_parallel_config.data_parallel_master_ip = (
-            reconfig_request.new_data_parallel_master_ip
-        )
-        new_parallel_config.data_parallel_master_port = (
-            reconfig_request.new_data_parallel_master_port
-        )
-        new_parallel_config._data_parallel_master_port_list = (
-            reconfig_request.new_data_parallel_master_port_list
-        )
-        new_parallel_config._coord_store_port = reconfig_request.coord_store_port
+            if (
+                reconfig_request.new_data_parallel_rank
+                != ReconfigureRankType.KEEP_CURRENT_RANK
+            ):
+                new_parallel_config.data_parallel_rank = (
+                    reconfig_request.new_data_parallel_rank
+                )
+            new_parallel_config.data_parallel_master_ip = (
+                reconfig_request.new_data_parallel_master_ip
+            )
+            new_parallel_config.data_parallel_master_port = (
+                reconfig_request.new_data_parallel_master_port
+            )
+            new_parallel_config._data_parallel_master_port_list = (
+                reconfig_request.new_data_parallel_master_port_list
+            )
+            new_parallel_config._coord_store_port = reconfig_request.coord_store_port
 
-        is_scale_down = reconfig_request.new_data_parallel_size < old_dp_size
-        is_shutdown = (
-            reconfig_request.new_data_parallel_rank
-            == ReconfigureRankType.SHUTDOWN_CURRENT_RANK
-        )
+            is_scale_down = reconfig_request.new_data_parallel_size < old_dp_size
+            is_shutdown = (
+                reconfig_request.new_data_parallel_rank
+                == ReconfigureRankType.SHUTDOWN_CURRENT_RANK
+            )
 
-        self.eep_scaling_state = ElasticEPScalingState(
-            model_executor=self.model_executor,
-            engine_core=self,
-            vllm_config=self.vllm_config,
-            new_parallel_config=new_parallel_config,
-            worker_type="removing" if is_shutdown else "existing",
-            scale_type="scale_down" if is_scale_down else "scale_up",
-            reconfig_request=reconfig_request,
-        )
-        self.process_input_queue_block = False
-        logger.info(
-            "[Elastic EP] Received reconfiguration request and starting scaling up/down"
-        )
+            self.eep_scaling_state = ElasticEPScalingState(
+                model_executor=self.model_executor,
+                engine_core=self,
+                vllm_config=self.vllm_config,
+                new_parallel_config=new_parallel_config,
+                worker_type="removing" if is_shutdown else "existing",
+                scale_type="scale_down" if is_scale_down else "scale_up",
+                reconfig_request=reconfig_request,
+            )
+            self.process_input_queue_block = False
+            logger.info(
+                "[Elastic EP] Received reconfiguration request and starting "
+                "scaling up/down"
+            )
 
     def _eep_send_engine_core_notification(
         self,
@@ -1869,17 +1875,20 @@ class DPEngineCoreProc(EngineCoreProc):
     def _eep_scale_up_before_kv_init(self):
         from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState
 
-        self.eep_scaling_state = ElasticEPScalingState(
-            model_executor=self.model_executor,
-            engine_core=self,
-            vllm_config=self.vllm_config,
-            new_parallel_config=self.vllm_config.parallel_config,
-            worker_type="new",
-            scale_type="scale_up",
-            reconfig_request=None,
-        )
-        self.eep_scaling_state.run_pre_kv_init_states()
-        self.process_input_queue_block = False
+        profiler = get_eep_profile(rank=self.dp_rank)
+        with profiler.track("_eep_scale_up_before_kv_init", "total"):
+            self.eep_scaling_state = ElasticEPScalingState(
+                model_executor=self.model_executor,
+                engine_core=self,
+                vllm_config=self.vllm_config,
+                new_parallel_config=self.vllm_config.parallel_config,
+                worker_type="new",
+                scale_type="scale_up",
+                reconfig_request=None,
+            )
+            with profiler.track("_eep_scale_up_before_kv_init", "run_pre_kv_init"):
+                self.eep_scaling_state.run_pre_kv_init_states()
+            self.process_input_queue_block = False
 
 
 class EngineCoreActorMixin:

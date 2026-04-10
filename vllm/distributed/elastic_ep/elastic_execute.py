@@ -23,6 +23,7 @@ from vllm.distributed import (
     get_pcp_group,
     get_tp_group,
 )
+from vllm.distributed.elastic_ep.profile import get_eep_profile
 from vllm.distributed.elastic_ep.standby_state import (
     create_standby_groups,
     get_standby_dp_group,
@@ -199,68 +200,71 @@ class ElasticEPScalingExecutor:
     def transfer_weights(self, old_dp_size: int, new_dp_size: int) -> None:
         standby_dp_group = get_standby_dp_group()
         assert standby_dp_group is not None
-        # Broadcast old_dp_size to all workers in standby group
-        if standby_dp_group.rank_in_group < old_dp_size:
-            old_dp_size_tensor = torch.tensor(
-                [old_dp_size], dtype=torch.int64, device="cpu"
+        profiler = get_eep_profile(rank=standby_dp_group.rank_in_group)
+        with profiler.track("transfer_weights", "total"):
+            if standby_dp_group.rank_in_group < old_dp_size:
+                old_dp_size_tensor = torch.tensor(
+                    [old_dp_size], dtype=torch.int64, device="cpu"
+                )
+            else:
+                old_dp_size_tensor = torch.empty(1, dtype=torch.int64, device="cpu")
+            old_dp_size_tensor = standby_dp_group.tcp_store_group.broadcast(
+                old_dp_size_tensor, 0
             )
-        else:
-            old_dp_size_tensor = torch.empty(1, dtype=torch.int64, device="cpu")
-        old_dp_size_tensor = standby_dp_group.tcp_store_group.broadcast(
-            old_dp_size_tensor, 0
-        )
 
-        num_new_workers = new_dp_size - old_dp_size
-        dp_rank = self.worker.vllm_config.parallel_config.data_parallel_rank
+            num_new_workers = new_dp_size - old_dp_size
+            dp_rank = self.worker.vllm_config.parallel_config.data_parallel_rank
+            num_dst_per_sender = num_new_workers // old_dp_size
+            remainder = num_new_workers % old_dp_size
 
-        # Sender-receiver pairing: the first new_workers % old_dp_size
-        # senders get (k+1) contiguous receivers, the rest get k
-        # receivers.
-        num_dst_per_sender = num_new_workers // old_dp_size
-        remainder = num_new_workers % old_dp_size
+            if dp_rank < remainder:
+                recv_begin = dp_rank * (num_dst_per_sender + 1)
+                recv_end = recv_begin + num_dst_per_sender + 1
+            else:
+                recv_begin = (
+                    remainder * (num_dst_per_sender + 1)
+                    + (dp_rank - remainder) * num_dst_per_sender
+                )
+                recv_end = recv_begin + num_dst_per_sender
 
-        if dp_rank < remainder:
-            recv_begin = dp_rank * (num_dst_per_sender + 1)
-            recv_end = recv_begin + num_dst_per_sender + 1
-        else:
-            recv_begin = (
-                remainder * (num_dst_per_sender + 1)
-                + (dp_rank - remainder) * num_dst_per_sender
+            ranks_to_send = list(
+                range(old_dp_size + recv_begin, old_dp_size + recv_end)
             )
-            recv_end = recv_begin + num_dst_per_sender
 
-        ranks_to_send = list(range(old_dp_size + recv_begin, old_dp_size + recv_end))
-
-        model = self.worker.model_runner.get_model()
-        for new_worker_rank in sorted(ranks_to_send):
-            batch_transfer_weights(
-                model=model,
-                is_sender=True,
-                peer_rank=new_worker_rank,
-                dp_group=standby_dp_group,
-                expert_weights=model.expert_weights,
-            )
-        torch.accelerator.synchronize()
+            model = self.worker.model_runner.get_model()
+            for new_worker_rank in sorted(ranks_to_send):
+                batch_transfer_weights(
+                    model=model,
+                    is_sender=True,
+                    peer_rank=new_worker_rank,
+                    dp_group=standby_dp_group,
+                    expert_weights=model.expert_weights,
+                )
+            torch.accelerator.synchronize()
 
     def broadcast_expert_mapping(self) -> None:
         standby_dp_group = get_standby_dp_group()
         assert standby_dp_group is not None
-        model_config = self.worker.model_runner.model_config
-        eplb_state = self.worker.model_runner.eplb_state
-        assert eplb_state is not None
-        eplb_model_state = eplb_state.model_states[model_config.compute_hash()]
-        physical_to_logical = eplb_model_state.physical_to_logical_map
-        num_physical_experts = physical_to_logical.shape[1]
-        num_local_physical_experts = num_physical_experts // get_ep_group().world_size
-        num_logical_experts = eplb_model_state.logical_replica_count.shape[1]
-        broadcast_expert_mapping(
-            physical_to_logical=physical_to_logical,
-            num_local_physical_experts=num_local_physical_experts,
-            num_logical_experts=num_logical_experts,
-            dp_group=standby_dp_group,
-            src_rank=0,
-            device=self.worker.device,
-        )
+        profiler = get_eep_profile(rank=standby_dp_group.rank_in_group)
+        with profiler.track("broadcast_expert_mapping", ""):
+            model_config = self.worker.model_runner.model_config
+            eplb_state = self.worker.model_runner.eplb_state
+            assert eplb_state is not None
+            eplb_model_state = eplb_state.model_states[model_config.compute_hash()]
+            physical_to_logical = eplb_model_state.physical_to_logical_map
+            num_physical_experts = physical_to_logical.shape[1]
+            num_local_physical_experts = (
+                num_physical_experts // get_ep_group().world_size
+            )
+            num_logical_experts = eplb_model_state.logical_replica_count.shape[1]
+            broadcast_expert_mapping(
+                physical_to_logical=physical_to_logical,
+                num_local_physical_experts=num_local_physical_experts,
+                num_logical_experts=num_logical_experts,
+                dp_group=standby_dp_group,
+                src_rank=0,
+                device=self.worker.device,
+            )
 
     def _release_cuda_graphs(self) -> None:
         if isinstance(self.worker.model_runner.model, CUDAGraphWrapper):
@@ -283,11 +287,15 @@ class ElasticEPScalingExecutor:
         _replace_active_groups(world=None, dp=None, ep=None, eplb=None, node_count=None)
 
     def switch_and_prepare(self) -> None:
+        profiler = get_eep_profile(
+            rank=self.worker.vllm_config.parallel_config.data_parallel_rank
+        )
         old_dp_size = get_dp_group().world_size
         old_ep_size = get_ep_group().world_size
 
-        self._release_cuda_graphs()
-        _replace_active_groups(**pop_standby_groups())
+        with profiler.track("switch_and_prepare", "switch_to_standby_groups"):
+            self._release_cuda_graphs()
+            _replace_active_groups(**pop_standby_groups())
 
         parallel_config = self.worker.vllm_config.parallel_config
         reconfig_request = self.reconfig_request
@@ -329,20 +337,21 @@ class ElasticEPScalingExecutor:
             module.moe_config.num_local_experts == num_local_experts
             for module in moe_modules
         ), "All MoE modules must have the same number of experts"
-        for module in moe_modules:
-            module.moe_config.num_experts = num_local_experts * new_ep_size
-            module.global_num_experts = module.moe_config.num_experts
-            tp_size = get_tp_group().world_size
-            is_sequence_parallel = parallel_config.use_sequence_parallel_moe
-            sp_size = tp_size if is_sequence_parallel else 1
-            module.moe_parallel_config = FusedMoEParallelConfig.make(
-                tp_size_=tp_size,
-                pcp_size_=get_pcp_group().world_size,
-                dp_size_=get_dp_group().world_size,
-                sp_size_=sp_size,
-                vllm_parallel_config=parallel_config,
-            )
-            module.moe_config.moe_parallel_config = module.moe_parallel_config
+        with profiler.track("switch_and_prepare", "reconfigure_moe_modules"):
+            for module in moe_modules:
+                module.moe_config.num_experts = num_local_experts * new_ep_size
+                module.global_num_experts = module.moe_config.num_experts
+                tp_size = get_tp_group().world_size
+                is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+                sp_size = tp_size if is_sequence_parallel else 1
+                module.moe_parallel_config = FusedMoEParallelConfig.make(
+                    tp_size_=tp_size,
+                    pcp_size_=get_pcp_group().world_size,
+                    dp_size_=get_dp_group().world_size,
+                    sp_size_=sp_size,
+                    vllm_parallel_config=parallel_config,
+                )
+                module.moe_config.moe_parallel_config = module.moe_parallel_config
 
         # Update EPLB state
         eplb_state = self.worker.model_runner.eplb_state
@@ -395,23 +404,24 @@ class ElasticEPScalingExecutor:
 
         model = self.worker.model_runner.get_model()
         model.expert_weights = []
-        with set_current_vllm_config(self.worker.vllm_config):
-            model.set_eplb_state(
-                eplb_model_state.expert_load_pass,
-                eplb_model_state.logical_to_physical_map,
-                eplb_model_state.logical_replica_count,
-            )
-            eplb_state._init_should_record_tensor(model)
-            model.update_physical_experts_metadata(
-                num_physical_experts=num_physical_experts,
-                num_local_physical_experts=num_local_experts,
-            )
-            # Force re-creation of the modular kernel (and all2all manager)
-            # for the new EP size by resetting quant_method to base
-            for module in moe_modules:
-                if hasattr(module.quant_method, "old_quant_method"):
-                    module._replace_quant_method(module.quant_method.old_quant_method)
-            prepare_communication_buffer_for_model(self.worker.model_runner.model)
+        with profiler.track(
+            "switch_and_prepare", "set_eplb_state_and_prepare_buffers"
+        ):
+            with set_current_vllm_config(self.worker.vllm_config):
+                model.set_eplb_state(
+                    eplb_model_state.expert_load_pass,
+                    eplb_model_state.logical_to_physical_map,
+                    eplb_model_state.logical_replica_count,
+                )
+                eplb_state._init_should_record_tensor(model)
+                model.update_physical_experts_metadata(
+                    num_physical_experts=num_physical_experts,
+                    num_local_physical_experts=num_local_experts,
+                )
+                for module in moe_modules:
+                    if hasattr(module.quant_method, "old_quant_method"):
+                        module._replace_quant_method(module.quant_method.old_quant_method)
+                prepare_communication_buffer_for_model(self.worker.model_runner.model)
 
         eplb_model_state.communicator = create_eplb_communicator(
             group_coordinator=get_eplb_group(),
@@ -442,9 +452,10 @@ class ElasticEPScalingExecutor:
             )
         multi_block_table.clear()
 
-        unlock_workspace()
-        self.worker.compile_or_warm_up_model()
-        lock_workspace()
+        with profiler.track("switch_and_prepare", "compile_or_warm_up_model"):
+            unlock_workspace()
+            self.worker.compile_or_warm_up_model()
+            lock_workspace()
 
         for bt, (saved_gpu, saved_cpu) in zip(
             multi_block_table.block_tables, saved_block_tables
@@ -483,8 +494,12 @@ class ElasticEPScalingExecutor:
             logger.info("[Elastic EP] Expert resharding completed")
 
     def perform_eplb_reshuffle(self) -> None:
-        self._perform_eplb_reshuffle()
-        self._set_eplb_suppressed(False)
+        profiler = get_eep_profile(
+            rank=self.worker.vllm_config.parallel_config.data_parallel_rank
+        )
+        with profiler.track("perform_eplb_reshuffle", ""):
+            self._perform_eplb_reshuffle()
+            self._set_eplb_suppressed(False)
 
     def perform_scale_down_eplb_reshuffle(self, new_dp_size: int) -> None:
         self._set_eplb_suppressed(True)
@@ -501,38 +516,40 @@ class ElasticEPScalingExecutor:
     def receive_weights(self) -> None:
         dp_group = get_dp_group()
         assert isinstance(dp_group, StatelessGroupCoordinator)
-        new_dp_size = dp_group.world_size
-        dp_rank = self.worker.vllm_config.parallel_config.data_parallel_rank
+        profiler = get_eep_profile(rank=dp_group.rank_in_group)
+        with profiler.track("receive_weights", "total"):
+            new_dp_size = dp_group.world_size
+            dp_rank = self.worker.vllm_config.parallel_config.data_parallel_rank
 
-        # Receive old_dp_size broadcasted during transfer_weights
-        old_dp_size_tensor = torch.empty(1, dtype=torch.int64, device="cpu")
-        old_dp_size_tensor = dp_group.tcp_store_group.broadcast(old_dp_size_tensor, 0)
-        old_dp_size = int(old_dp_size_tensor[0].item())
-
-        # Calculate which existing worker will send to this new worker
-        num_new_workers = new_dp_size - old_dp_size
-        new_worker_idx = dp_rank - old_dp_size
-        num_dst_per_sender = num_new_workers // old_dp_size
-        remainder = num_new_workers % old_dp_size
-
-        if new_worker_idx < remainder * (num_dst_per_sender + 1):
-            sender_rank = new_worker_idx // (num_dst_per_sender + 1)
-        else:
-            sender_rank = (
-                remainder
-                + (new_worker_idx - remainder * (num_dst_per_sender + 1))
-                // num_dst_per_sender
+            old_dp_size_tensor = torch.empty(1, dtype=torch.int64, device="cpu")
+            old_dp_size_tensor = dp_group.tcp_store_group.broadcast(
+                old_dp_size_tensor, 0
             )
+            old_dp_size = int(old_dp_size_tensor[0].item())
 
-        model = self.worker.model_runner.get_model()
-        batch_transfer_weights(
-            model=model,
-            is_sender=False,
-            peer_rank=sender_rank,
-            dp_group=dp_group,
-            expert_weights=model.expert_weights,
-        )
-        torch.accelerator.synchronize()
+            num_new_workers = new_dp_size - old_dp_size
+            new_worker_idx = dp_rank - old_dp_size
+            num_dst_per_sender = num_new_workers // old_dp_size
+            remainder = num_new_workers % old_dp_size
+
+            if new_worker_idx < remainder * (num_dst_per_sender + 1):
+                sender_rank = new_worker_idx // (num_dst_per_sender + 1)
+            else:
+                sender_rank = (
+                    remainder
+                    + (new_worker_idx - remainder * (num_dst_per_sender + 1))
+                    // num_dst_per_sender
+                )
+
+            model = self.worker.model_runner.get_model()
+            batch_transfer_weights(
+                model=model,
+                is_sender=False,
+                peer_rank=sender_rank,
+                dp_group=dp_group,
+                expert_weights=model.expert_weights,
+            )
+            torch.accelerator.synchronize()
 
     def receive_expert_mapping(self) -> tuple[torch.Tensor, int, int]:
         dp_group = get_dp_group()
@@ -566,5 +583,11 @@ class ElasticEPScalingExecutor:
         )
 
     def prepare_new_worker(self) -> None:
-        with set_current_vllm_config(self.worker.vllm_config):
-            prepare_communication_buffer_for_model(self.worker.model_runner.get_model())
+        profiler = get_eep_profile(
+            rank=self.worker.vllm_config.parallel_config.data_parallel_rank
+        )
+        with profiler.track("prepare_new_worker", ""):
+            with set_current_vllm_config(self.worker.vllm_config):
+                prepare_communication_buffer_for_model(
+                    self.worker.model_runner.get_model()
+                )

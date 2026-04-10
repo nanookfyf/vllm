@@ -254,6 +254,7 @@ if TYPE_CHECKING:
     VLLM_CUDA_COMPATIBILITY_PATH: str | None = None
     VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
+    VLLM_EEP_PROFILE_CSV: str = ""
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = False
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
@@ -1692,6 +1693,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ELASTIC_EP_DRAIN_REQUESTS": lambda: bool(
         int(os.getenv("VLLM_ELASTIC_EP_DRAIN_REQUESTS", "0"))
     ),
+    # Base CSV path used to record elastic EP profiling events.
+    # When empty, elastic EP profiling is disabled.
+    "VLLM_EEP_PROFILE_CSV": lambda: os.getenv("VLLM_EEP_PROFILE_CSV", ""),
     # If set to 1, enable CUDA graph memory estimation during memory profiling.
     # This profiles CUDA graph memory usage to provide more accurate KV cache
     # memory allocation. Disabled by default to preserve existing behavior.

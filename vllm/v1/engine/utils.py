@@ -19,6 +19,7 @@ import zmq
 
 from vllm import envs
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig
+from vllm.distributed.elastic_ep.profile import get_eep_profile
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.ray.ray_env import get_env_vars_to_copy
@@ -745,9 +746,11 @@ class CoreEngineActorManager:
             "for scale up"
         )
 
-        placement_groups, local_dp_ranks = self.add_dp_placement_groups(
-            cur_vllm_config, new_data_parallel_size
-        )
+        profiler = get_eep_profile()
+        with profiler.track("scale_up_elastic_ep", "add_dp_placement_groups"):
+            placement_groups, local_dp_ranks = self.add_dp_placement_groups(
+                cur_vllm_config, new_data_parallel_size
+            )
 
         world_size = cur_vllm_config.parallel_config.world_size
         dp_master_ip = cur_vllm_config.parallel_config.data_parallel_master_ip
@@ -756,65 +759,68 @@ class CoreEngineActorManager:
         runtime_env = RuntimeEnv(
             env_vars=self.env_vars_dict | {"VLLM_ELASTIC_EP_SCALE_UP_LAUNCH": "1"}
         )
-        for i, (pg, local_rank) in enumerate(zip(placement_groups, local_dp_ranks)):
-            rank = cur_data_parallel_size + i
-            dp_vllm_config = copy.deepcopy(cur_vllm_config)
-            dp_vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
-            dp_vllm_config.parallel_config.placement_group = pg
+        with profiler.track("scale_up_elastic_ep", "create_actors"):
+            for i, (pg, local_rank) in enumerate(zip(placement_groups, local_dp_ranks)):
+                rank = cur_data_parallel_size + i
+                dp_vllm_config = copy.deepcopy(cur_vllm_config)
+                dp_vllm_config.parallel_config.data_parallel_size = (
+                    new_data_parallel_size
+                )
+                dp_vllm_config.parallel_config.placement_group = pg
 
-            # Check if this placement group is on the head node
-            local_client = any(
-                bundle.get("node:" + dp_master_ip, 0) > 0 for bundle in pg.bundle_specs
-            )
-
-            if local_client:
-                new_local_engines += 1
-                # Update data_parallel_size_local
-                dp_vllm_config.parallel_config.data_parallel_size_local = (
-                    cur_vllm_config.parallel_config.data_parallel_size_local
-                    + new_local_engines
+                local_client = any(
+                    bundle.get("node:" + dp_master_ip, 0) > 0
+                    for bundle in pg.bundle_specs
                 )
 
-            actor = (
-                ray.remote(actor_class)
-                .options(
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=pg,
-                        placement_group_bundle_index=world_size,
-                    ),
-                    runtime_env=runtime_env,
-                )
-                .remote(
-                    vllm_config=dp_vllm_config,
-                    executor_class=self.executor_class,
-                    log_stats=self.log_stats,
-                    local_client=local_client,
-                    addresses=self.addresses,
-                    dp_rank=rank,
-                    local_dp_rank=local_rank,
-                )
-            )
+                if local_client:
+                    new_local_engines += 1
+                    dp_vllm_config.parallel_config.data_parallel_size_local = (
+                        cur_vllm_config.parallel_config.data_parallel_size_local
+                        + new_local_engines
+                    )
 
-            if local_client:
-                self.local_engine_actors.append(actor)
-            else:
-                self.remote_engine_actors.append(actor)
-            self.created_placement_groups.append(pg)
-            self.placement_group_is_local.append(local_client)
-
-        ray.get(
-            [
-                actor.wait_for_init.remote()
-                for actor in (
-                    self.local_engine_actors[-new_local_engines:]
-                    if new_local_engines > 0
-                    else []
+                actor = (
+                    ray.remote(actor_class)
+                    .options(
+                        scheduling_strategy=PlacementGroupSchedulingStrategy(
+                            placement_group=pg,
+                            placement_group_bundle_index=world_size,
+                        ),
+                        runtime_env=runtime_env,
+                    )
+                    .remote(
+                        vllm_config=dp_vllm_config,
+                        executor_class=self.executor_class,
+                        log_stats=self.log_stats,
+                        local_client=local_client,
+                        addresses=self.addresses,
+                        dp_rank=rank,
+                        local_dp_rank=local_rank,
+                    )
                 )
-                + self.remote_engine_actors[
-                    -(len(placement_groups) - new_local_engines) :
+
+                if local_client:
+                    self.local_engine_actors.append(actor)
+                else:
+                    self.remote_engine_actors.append(actor)
+                self.created_placement_groups.append(pg)
+                self.placement_group_is_local.append(local_client)
+
+        with profiler.track("scale_up_elastic_ep", "wait_for_init"):
+            ray.get(
+                [
+                    actor.wait_for_init.remote()
+                    for actor in (
+                        self.local_engine_actors[-new_local_engines:]
+                        if new_local_engines > 0
+                        else []
+                    )
+                    + self.remote_engine_actors[
+                        -(len(placement_groups) - new_local_engines) :
+                    ]
                 ]
-            ]
-        )
+            )
 
         actors = (
             self.local_engine_actors[-new_local_engines:]
@@ -822,10 +828,11 @@ class CoreEngineActorManager:
             else []
         ) + self.remote_engine_actors[-(len(placement_groups) - new_local_engines) :]
 
-        for actor in actors:
-            ref = actor.run.remote()
-            self.run_refs.append(ref)
-            self.actor_run_ref_dict[actor] = ref
+        with profiler.track("scale_up_elastic_ep", "run_remote"):
+            for actor in actors:
+                ref = actor.run.remote()
+                self.run_refs.append(ref)
+                self.actor_run_ref_dict[actor] = ref
 
         cur_vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
         # Update old_vllm_config with new data_parallel_size_local if any new
@@ -845,14 +852,16 @@ class CoreEngineActorManager:
             f"than new_data_parallel_size {new_data_parallel_size} "
             "for scale down"
         )
-        for _ in range(cur_data_parallel_size - new_data_parallel_size):
-            pg = self.created_placement_groups.pop()
-            is_local = self.placement_group_is_local.pop()
-            if is_local:
-                self.local_engine_actors.pop()
-            else:
-                self.remote_engine_actors.pop()
-            ray.util.remove_placement_group(pg)
+        profiler = get_eep_profile()
+        with profiler.track("scale_down_elastic_ep", "teardown_actors"):
+            for _ in range(cur_data_parallel_size - new_data_parallel_size):
+                pg = self.created_placement_groups.pop()
+                is_local = self.placement_group_is_local.pop()
+                if is_local:
+                    self.local_engine_actors.pop()
+                else:
+                    self.remote_engine_actors.pop()
+                ray.util.remove_placement_group(pg)
 
     def remove_run_refs_for_scale_down(self, removed_dp_size: int) -> None:
         if removed_dp_size <= 0:
