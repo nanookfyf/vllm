@@ -321,7 +321,12 @@ class Executor(ABC):
         time_before_sleep = time.perf_counter()
         self.collective_rpc("sleep", kwargs=dict(level=level))
         time_after_sleep = time.perf_counter()
-        self.sleeping_tags = {"weights", "kv_cache"}
+        self.sleeping_tags = {
+            "weights",
+            "shared_weights",
+            "expert_weights",
+            "kv_cache",
+        }
         self.is_sleeping = True
         logger.info(
             "It took %.6f seconds to fall asleep.", time_after_sleep - time_before_sleep
@@ -337,7 +342,6 @@ class Executor(ABC):
                     logger.warning(
                         "Tag %s is not in sleeping tags %s", tag, self.sleeping_tags
                     )
-                    return
         time_before_wakeup = time.perf_counter()
         self.collective_rpc("wake_up", kwargs=dict(tags=tags))
         time_after_wakeup = time.perf_counter()

@@ -53,6 +53,7 @@ class AllocationData:
     handle: HandleType
     tag: str
     cpu_backup_tensor: torch.Tensor | None = None
+    is_mapped: bool = True
 
 
 def create_and_map(allocation_handle: HandleType) -> None:
@@ -158,7 +159,24 @@ class CuMemAllocator:
             self.current_tag,
             py_d_mem,
         )
-        return
+
+    def rename_tag(self, old_tag: str, new_tag: str) -> int:
+        """Rename all tracked allocations that currently use ``old_tag``."""
+        changed = 0
+        for data in self.pointer_to_data.values():
+            if data.tag == old_tag:
+                data.tag = new_tag
+                changed += 1
+        return changed
+
+    def retag_allocations_by_ptrs(self, ptrs: set[int], tag: str) -> int:
+        """Assign ``tag`` to tracked allocations identified by device ptr."""
+        changed = 0
+        for ptr, data in self.pointer_to_data.items():
+            if ptr in ptrs:
+                data.tag = tag
+                changed += 1
+        return changed
 
     def _python_free_callback(self, ptr: int) -> HandleType:
         """
@@ -175,14 +193,22 @@ class CuMemAllocator:
         )
         return data.handle
 
-    def sleep(self, offload_tags: tuple[str, ...] | str | None = None) -> None:
+    def sleep(
+        self,
+        offload_tags: tuple[str, ...] | str | None = None,
+        sleep_tags: tuple[str, ...] | str | None = None,
+    ) -> None:
         """
         Put the allocator in sleep mode.
         All data in the memory allocation with the specified tag will be
-        offloaded to CPU memory, and others will be discarded.
+        offloaded to CPU memory. When ``sleep_tags`` is provided, only matching
+        allocations are slept; otherwise all tracked allocations are considered.
 
         :param offload_tags: The tags of the memory allocation that will be
-            offloaded. The rest of the memory allocation will be discarded.
+            offloaded. Slept allocations whose tags are not listed here are
+            discarded.
+        :param sleep_tags: The tags of the memory allocation that should be put
+            to sleep. If None, all tracked allocations are considered.
         """
         if offload_tags is None:
             # by default, allocated tensors are offloaded
@@ -193,10 +219,19 @@ class CuMemAllocator:
 
         assert isinstance(offload_tags, tuple)
 
+        if isinstance(sleep_tags, str):
+            sleep_tags = (sleep_tags,)
+        if sleep_tags is not None:
+            assert isinstance(sleep_tags, tuple)
+
         total_bytes = 0
         backup_bytes = 0
 
         for ptr, data in self.pointer_to_data.items():
+            if sleep_tags is not None and data.tag not in sleep_tags:
+                continue
+            if not data.is_mapped:
+                continue
             handle = data.handle
             total_bytes += handle[1]
             if data.tag in offload_tags:
@@ -212,6 +247,7 @@ class CuMemAllocator:
                 libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
                 data.cpu_backup_tensor = cpu_backup_tensor
             unmap_and_release(handle)
+            data.is_mapped = False
 
         logger.info(
             "CuMemAllocator: sleep freed %.2f GiB memory in total, of which "
@@ -237,8 +273,11 @@ class CuMemAllocator:
         """
         for ptr, data in self.pointer_to_data.items():
             if tags is None or data.tag in tags:
+                if data.is_mapped:
+                    continue
                 handle = data.handle
                 create_and_map(handle)
+                data.is_mapped = True
                 if data.cpu_backup_tensor is not None:
                     cpu_backup_tensor = data.cpu_backup_tensor
                     if cpu_backup_tensor is not None:

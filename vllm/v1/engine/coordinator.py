@@ -162,6 +162,7 @@ class DPCoordinatorProc:
 
         self.stats_update_interval_ms = min_stats_update_interval_ms
         self.enable_wave_coordination = enable_wave_coordination
+        self.inactive_engines: set[int] = set()
 
     @staticmethod
     def run_coordinator(

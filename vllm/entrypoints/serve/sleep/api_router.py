@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
 import vllm.envs as envs
@@ -14,6 +14,31 @@ logger = init_logger(__name__)
 
 def engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
+
+
+def optional_tags(payload: dict, key: str) -> list[str] | None:
+    tags = payload.get(key)
+    if tags is None:
+        return None
+    if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
+        raise HTTPException(status_code=400, detail=f"{key} must be a list of strings")
+    if not tags:
+        raise HTTPException(status_code=400, detail=f"{key} must not be empty")
+    return tags
+
+
+def required_tags(payload: dict, key: str = "tags") -> list[str]:
+    tags = optional_tags(payload, key)
+    if tags is None:
+        raise HTTPException(status_code=400, detail=f"{key} is required")
+    return tags
+
+
+def optional_bool(payload: dict, key: str, default: bool) -> bool:
+    value = payload.get(key, default)
+    if not isinstance(value, bool):
+        raise HTTPException(status_code=400, detail=f"{key} must be a boolean")
+    return value
 
 
 router = APIRouter()
@@ -47,6 +72,90 @@ async def wake_up(raw_request: Request):
 async def is_sleeping(raw_request: Request):
     is_sleeping = await engine_client(raw_request).is_sleeping()
     return JSONResponse(content={"is_sleeping": is_sleeping})
+
+
+@router.post("/rearrange_ep_ranks")
+async def rearrange_ep_ranks(raw_request: Request):
+    payload = await raw_request.json()
+    sleeping_ep_ranks = payload["sleeping_ep_ranks"]
+    set_inactive = optional_bool(payload, "set_inactive", False)
+
+    client = engine_client(raw_request)
+    await client.collective_rpc(
+        "prepare_sleep_ep_ranks",
+        kwargs={"sleeping_ep_ranks": sleeping_ep_ranks},
+    )
+    if set_inactive:
+        await client.set_inactive_dp_ranks(sleeping_ep_ranks)
+    return JSONResponse(
+        content={
+            "ok": True,
+            "sleeping_ep_ranks": sleeping_ep_ranks,
+            "set_inactive": set_inactive,
+        }
+    )
+
+
+@router.post("/restore_rearranged_ep_ranks")
+async def restore_rearranged_ep_ranks(raw_request: Request):
+    payload = await raw_request.json()
+    clear_inactive = optional_bool(payload, "clear_inactive", False)
+
+    client = engine_client(raw_request)
+    await client.collective_rpc("restore_sleep_ep_ranks")
+    if clear_inactive:
+        await client.set_inactive_dp_ranks([])
+    return JSONResponse(
+        content={
+            "ok": True,
+            "clear_inactive": clear_inactive,
+        }
+    )
+
+
+
+@router.post("/sleep_ep_ranks_by_tags")
+async def sleep_ep_ranks_by_tags(raw_request: Request):
+    payload = await raw_request.json()
+    sleeping_ep_ranks = payload["sleeping_ep_ranks"]
+    tags = required_tags(payload, "tags")
+
+    await engine_client(raw_request).collective_rpc(
+        "sleep_ep_ranks_by_tags",
+        kwargs={
+            "sleeping_ep_ranks": sleeping_ep_ranks,
+            "tags": tags,
+        },
+    )
+    return JSONResponse(
+        content={
+            "ok": True,
+            "sleeping_ep_ranks": sleeping_ep_ranks,
+            "tags": tags,
+        }
+    )
+
+
+@router.post("/wake_up_ep_ranks_by_tags")
+async def wake_up_ep_ranks_by_tags(raw_request: Request):
+    payload = await raw_request.json()
+    sleeping_ep_ranks = payload["sleeping_ep_ranks"]
+    tags = required_tags(payload, "tags")
+
+    await engine_client(raw_request).collective_rpc(
+        "wake_up_ep_ranks",
+        kwargs={
+            "sleeping_ep_ranks": sleeping_ep_ranks,
+            "tags": tags,
+        },
+    )
+    return JSONResponse(
+        content={
+            "ok": True,
+            "sleeping_ep_ranks": sleeping_ep_ranks,
+            "tags": tags,
+        }
+    )
 
 
 def attach_router(app: FastAPI):

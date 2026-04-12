@@ -941,6 +941,9 @@ class AsyncLLM(EngineClient):
             method, timeout, args, kwargs
         )
 
+    async def set_inactive_dp_ranks(self, inactive_ranks: list[int]) -> None:
+        await self.engine_core.set_inactive_dp_ranks_async(inactive_ranks)
+
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
         """Wait for all requests to be drained."""
         start_time = time.time()

@@ -267,6 +267,9 @@ class ElasticEPScalingExecutor:
             )
 
     def _release_cuda_graphs(self) -> None:
+        profiler = get_eep_profile(
+            rank=self.worker.vllm_config.parallel_config.data_parallel_rank
+        )
         if isinstance(self.worker.model_runner.model, CUDAGraphWrapper):
             wrapper = self.worker.model_runner.model
             wrapper.concrete_cudagraph_entries = {}
@@ -274,17 +277,27 @@ class ElasticEPScalingExecutor:
         elif isinstance(self.worker.model_runner.model, UBatchWrapper):
             raise RuntimeError("DBO is not yet supported in elastic EP")
 
-        torch.compiler.reset()
-        with set_current_vllm_config(self.worker.vllm_config):
-            reset_compile_wrapper(self.worker.model_runner.get_model())
+        with profiler.track("_release_cuda_graphs", "compiler_reset"):
+            torch.compiler.reset()
+            with set_current_vllm_config(self.worker.vllm_config):
+                reset_compile_wrapper(self.worker.model_runner.get_model())
 
-        gc.collect()
-        torch.accelerator.synchronize()
-        torch.accelerator.empty_cache()
+        with profiler.track("_release_cuda_graphs", "gc_collect"):
+            gc.collect()
+        with profiler.track("_release_cuda_graphs", "cuda_synchronize"):
+            torch.accelerator.synchronize()
+        with profiler.track("_release_cuda_graphs", "cuda_empty_cache"):
+            torch.accelerator.empty_cache()
 
     def switch_and_remove(self) -> None:
-        self._release_cuda_graphs()
-        _replace_active_groups(world=None, dp=None, ep=None, eplb=None, node_count=None)
+        profiler = get_eep_profile(
+            rank=self.worker.vllm_config.parallel_config.data_parallel_rank
+        )
+        with profiler.track("switch_and_remove", "release_cuda_graphs"):
+            self._release_cuda_graphs()
+        with profiler.track("switch_and_remove", "replace_active_groups(teardown)"):
+            _replace_active_groups(world=None, dp=None, ep=None,
+                                   eplb=None, node_count=None)
 
     def switch_and_prepare(self) -> None:
         profiler = get_eep_profile(
@@ -294,8 +307,11 @@ class ElasticEPScalingExecutor:
         old_ep_size = get_ep_group().world_size
 
         with profiler.track("switch_and_prepare", "switch_to_standby_groups"):
-            self._release_cuda_graphs()
-            _replace_active_groups(**pop_standby_groups())
+            with profiler.track("switch_and_prepare", "release_cuda_graphs"):
+                self._release_cuda_graphs()
+            with profiler.track("switch_and_prepare",
+                                "replace_active_groups"):
+                _replace_active_groups(**pop_standby_groups())
 
         parallel_config = self.worker.vllm_config.parallel_config
         reconfig_request = self.reconfig_request

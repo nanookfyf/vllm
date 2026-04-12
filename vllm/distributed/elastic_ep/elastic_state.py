@@ -208,12 +208,18 @@ class ElasticEPScalingState:
 
         # TODO(yongji): figure out appropriate timeout for the barrier
         timeout = None if dp_store.check([sync_key]) else timedelta(seconds=5)
+        profiler = get_eep_profile(rank=group_rank)
 
         try:
-            self._execute_tcp_store_barrier(
-                dp_store, group_rank, group_size, barrier_id, timeout=timeout
-            )
-            torch.distributed.barrier(dp_group)
+            with profiler.track("_staged_barrier",
+                                f"tcp_store_barrier({barrier_name})"):
+                self._execute_tcp_store_barrier(
+                    dp_store, group_rank, group_size, barrier_id,
+                    timeout=timeout
+                )
+            with profiler.track("_staged_barrier",
+                                f"torch_barrier({barrier_name})"):
+                torch.distributed.barrier(dp_group)
             if group_rank == 0:
                 dp_store.delete_key(sync_key)
                 for i in range(group_size):
@@ -479,13 +485,18 @@ class ElasticEPScalingState:
         assert self.old_dp_group is not None
         profiler = get_eep_profile(rank=self.old_dp_group.rank())
         with profiler.track("_create_standby_groups", "init_dp_group_and_rpc"):
-            self.new_dp_group, self.new_dp_store = (
-                self.new_parallel_config.stateless_init_dp_group(return_store=True)
-            )
-            self.model_executor.collective_rpc(
-                "elastic_ep_execute",
-                args=("create_standby_groups", self.reconfig_request),
-            )
+            with profiler.track("_create_standby_groups",
+                                "stateless_init_dp_group"):
+                self.new_dp_group, self.new_dp_store = (
+                    self.new_parallel_config.stateless_init_dp_group(
+                        return_store=True)
+                )
+            with profiler.track("_create_standby_groups",
+                                "collective_rpc(create_standby_groups)"):
+                self.model_executor.collective_rpc(
+                    "elastic_ep_execute",
+                    args=("create_standby_groups", self.reconfig_request),
+                )
         if self.old_dp_group.rank() == 0:
             logger.info("[Elastic EP] Created standby communication groups")
 
@@ -532,7 +543,9 @@ class ElasticEPScalingState:
             self.model_executor.collective_rpc(
                 "elastic_ep_execute", args=("switch_and_prepare",)
             )
-        stateless_destroy_torch_distributed_process_group(old_dp_group)
+        with profiler.track("_switch_and_prepare",
+                            "destroy_old_dp_group"):
+            stateless_destroy_torch_distributed_process_group(old_dp_group)
         assert self.new_dp_group is not None
         new_dp_group = self.new_dp_group
         with profiler.track("_switch_and_prepare", "sync_state"):
@@ -547,9 +560,13 @@ class ElasticEPScalingState:
                 dtype=torch.int32,
                 device="cpu",
             )
-            torch.distributed.all_reduce(
-                tensor, op=torch.distributed.ReduceOp.MAX, group=new_dp_group
-            )
+            with profiler.track("_switch_and_prepare",
+                                f"sync_state_all_reduce("
+                                f"gs={new_dp_group.size()})"):
+                torch.distributed.all_reduce(
+                    tensor, op=torch.distributed.ReduceOp.MAX,
+                    group=new_dp_group
+                )
             data = tensor.tolist()
             self.engine_core.engines_running = bool(data[0])
             self.engine_core.current_wave = int(data[1])

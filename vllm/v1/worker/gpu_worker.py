@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 import vllm.envs as envs
@@ -33,6 +34,8 @@ from vllm.distributed.kv_transfer import (
 )
 from vllm.distributed.parallel_state import (
     Handle,
+    get_dp_group,
+    get_ep_group,
     get_pp_group,
     get_tp_group,
 )
@@ -154,13 +157,26 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+        self._skip_dummy_batch = False
+        self._sync_only_sleep_active = False
+        self._partial_sleep_wake_tags: list[str] | None = None
 
     def sleep(self, level: int = 1) -> None:
+        self._sleep_with_tags(
+            level=level,
+            offload_tags=("weights",) if level == 1 else tuple(),
+        )
+
+    def _sleep_with_tags(
+        self,
+        level: int = 1,
+        offload_tags: tuple[str, ...] | None = None,
+        sleep_tags: tuple[str, ...] | None = None,
+    ) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
 
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
 
-        # Save the buffers before level 2 sleep
         if level == 2:
             model = self.model_runner.model
             self._sleep_saved_buffers = {
@@ -168,7 +184,9 @@ class Worker(WorkerBase):
             }
 
         allocator = CuMemAllocator.get_instance()
-        allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+        
+        allocator.sleep(offload_tags=offload_tags, sleep_tags=sleep_tags)
+
         free_bytes_after_sleep, total = torch.cuda.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         used_bytes = total - free_bytes_after_sleep
@@ -185,7 +203,6 @@ class Worker(WorkerBase):
         allocator = CuMemAllocator.get_instance()
         allocator.wake_up(tags)
 
-        # Restore the buffers after level 2 sleep
         if len(self._sleep_saved_buffers):
             model = self.model_runner.model
             for name, buffer in model.named_buffers():
@@ -193,9 +210,6 @@ class Worker(WorkerBase):
                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
             self._sleep_saved_buffers = {}
 
-        # If the KV cache has just been woken up,
-        # the internal state of cache_engine must be reset,
-        # especially the FP8 scaling factor.
         if (
             (tags is None or "kv_cache" in tags)
             and is_quantized_kv_cache(self.cache_config.cache_dtype)
@@ -203,6 +217,40 @@ class Worker(WorkerBase):
         ):
             self.model_runner.init_fp8_kv_scales()
 
+    def prepare_sleep_ep_ranks(self, sleeping_ep_ranks: list[int]) -> None:
+        self.model_runner.prepare_sleep_ep_ranks(sleeping_ep_ranks)
+
+    def restore_sleep_ep_ranks(self) -> None:
+        self.model_runner.restore_sleep_ep_ranks()
+
+    def sleep_ep_ranks_by_tags(
+        self,
+        sleeping_ep_ranks: list[int],
+        tags: list[str],
+        level: int = 1,
+    ) -> None:
+        if get_ep_group().rank not in sleeping_ep_ranks:
+            return
+
+        selected_tags = tuple(dict.fromkeys(tags))
+        if not selected_tags:
+            raise ValueError("tags must not be empty")
+
+        self._sleep_with_tags(
+            level=level,
+            offload_tags=selected_tags,
+            sleep_tags=selected_tags,
+        )
+
+    def wake_up_ep_ranks(
+        self,
+        sleeping_ep_ranks: list[int],
+        tags: list[str] | None = None,
+    ) -> None:
+        if get_ep_group().rank in sleeping_ep_ranks:
+            self.wake_up(tags=tags)
+            self._skip_dummy_batch = False
+            self._sync_only_sleep_active = False
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         if not self.vllm_config.model_config.enable_sleep_mode:
             return nullcontext()
