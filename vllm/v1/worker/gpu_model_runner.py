@@ -6307,6 +6307,22 @@ class GPUModelRunner(
             )
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
+    def prepare_sleep_ep_ranks(self, sleeping_ep_ranks: list[int]) -> None:
+        assert self.parallel_config.enable_eplb, (
+            "Logical EP sleep requires EPLB to manage expert mappings."
+        )
+        assert self.eplb_state is not None
+        model = self.get_model()
+        assert is_mixture_of_experts(model), "Logical EP sleep requires an MoE model."
+        self.eplb_state.prepare_logical_sleep(sleeping_ep_ranks)
+
+    def restore_sleep_ep_ranks(self) -> None:
+        assert self.eplb_state is not None
+        model = self.get_model()
+        assert is_mixture_of_experts(model), "Logical EP sleep requires an MoE model."
+        self.eplb_state.restore_logical_sleep()
+        
+
     def _check_and_update_cudagraph_mode(
         self,
         attention_backends: list[set[type[AttentionBackend]]],
