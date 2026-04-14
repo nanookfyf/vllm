@@ -931,6 +931,7 @@ class EplbState:
             raise RuntimeError("logical sleep requires EPLB-managed MoE models")
 
         ep_group = get_ep_group().device_group
+        # Example: rank_mapping = {0:0, 1:1, 2:2, 3:-1}
         rank_mapping = self.build_logical_sleep_rank_mapping(
             ep_group.size(), sleeping_ranks
         )

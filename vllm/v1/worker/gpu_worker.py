@@ -187,6 +187,14 @@ class Worker(WorkerBase):
         
         allocator.sleep(offload_tags=offload_tags, sleep_tags=sleep_tags)
 
+        # Avoid dummy forwards while weight-tagged (or full) pools are slept.
+        _wt = frozenset(("weights", "shared_weights", "expert_weights"))
+        _off = offload_tags if isinstance(offload_tags, tuple) else ()
+        if sleep_tags is None or len(sleep_tags) == 0:
+            self.model_runner.skip_dummy_model_forward = True
+        elif any(t in _wt for t in (*_off, *sleep_tags)):
+            self.model_runner.skip_dummy_model_forward = True
+
         free_bytes_after_sleep, total = torch.cuda.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         used_bytes = total - free_bytes_after_sleep
@@ -202,6 +210,10 @@ class Worker(WorkerBase):
 
         allocator = CuMemAllocator.get_instance()
         allocator.wake_up(tags)
+
+        _wt = frozenset(("weights", "shared_weights", "expert_weights"))
+        if tags is None or _wt.intersection(tags):
+            self.model_runner.skip_dummy_model_forward = False
 
         if len(self._sleep_saved_buffers):
             model = self.model_runner.model
@@ -219,9 +231,16 @@ class Worker(WorkerBase):
 
     def prepare_sleep_ep_ranks(self, sleeping_ep_ranks: list[int]) -> None:
         self.model_runner.prepare_sleep_ep_ranks(sleeping_ep_ranks)
+        if get_ep_group().rank in sleeping_ep_ranks:
+            self._skip_dummy_batch = True
+            self._sync_only_sleep_active = True
+            self.model_runner.sync_only_sleep_active = True
 
     def restore_sleep_ep_ranks(self) -> None:
         self.model_runner.restore_sleep_ep_ranks()
+        self._skip_dummy_batch = False
+        self._sync_only_sleep_active = False
+        self.model_runner.sync_only_sleep_active = False
 
     def sleep_ep_ranks_by_tags(
         self,
@@ -241,6 +260,9 @@ class Worker(WorkerBase):
             offload_tags=selected_tags,
             sleep_tags=selected_tags,
         )
+        self._skip_dummy_batch = True
+        self._sync_only_sleep_active = True
+        self.model_runner.sync_only_sleep_active = True
 
     def wake_up_ep_ranks(
         self,
@@ -251,6 +273,8 @@ class Worker(WorkerBase):
             self.wake_up(tags=tags)
             self._skip_dummy_batch = False
             self._sync_only_sleep_active = False
+            self.model_runner.sync_only_sleep_active = False
+
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         if not self.vllm_config.model_config.enable_sleep_mode:
             return nullcontext()
@@ -365,11 +389,16 @@ class Worker(WorkerBase):
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
-        with (
-            self._maybe_get_memory_pool_context(tag="weights"),
-            set_current_vllm_config(self.vllm_config),
-        ):
-            self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+        profiler = get_eep_profile(
+            rank=self.vllm_config.parallel_config.data_parallel_rank
+        )
+        with profiler.track("load_model", "total"):
+            with (
+                self._maybe_get_memory_pool_context(tag="weights"),
+                set_current_vllm_config(self.vllm_config),
+            ):
+                with profiler.track("load_model", "model_runner_load_model"):
+                    self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
@@ -390,145 +419,165 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
-        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
-            # still need a profile run which compiles the model for
-            # max_num_batched_tokens
-            self.model_runner.profile_run()
+        profiler = get_eep_profile(
+            rank=self.vllm_config.parallel_config.data_parallel_rank
+        )
+        with profiler.track("determine_available_memory", "total"):
+            if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+                # still need a profile run which compiles the model for
+                # max_num_batched_tokens
+                with profiler.track("determine_available_memory", "profile_run"):
+                    self.model_runner.profile_run()
 
-            msg = (
-                f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
-                f"GiB, reserved {format_gib(kv_cache_memory_bytes)} GiB memory for "
-                "KV Cache as specified by kv_cache_memory_bytes config and "
-                "skipped memory profiling. This does not respect the "
-                "gpu_memory_utilization config. Only use kv_cache_memory_bytes "
-                "config when you want manual control of KV cache memory "
-                "size. If OOM'ed, check the difference of initial free "
-                "memory between the current run and the previous run "
-                "where kv_cache_memory_bytes is suggested and update it "
-                "correspondingly."
+                msg = (
+                    f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
+                    f"GiB, reserved {format_gib(kv_cache_memory_bytes)} GiB memory for "
+                    "KV Cache as specified by kv_cache_memory_bytes config and "
+                    "skipped memory profiling. This does not respect the "
+                    "gpu_memory_utilization config. Only use kv_cache_memory_bytes "
+                    "config when you want manual control of KV cache memory "
+                    "size. If OOM'ed, check the difference of initial free "
+                    "memory between the current run and the previous run "
+                    "where kv_cache_memory_bytes is suggested and update it "
+                    "correspondingly."
+                )
+                logger.info(msg)
+                return kv_cache_memory_bytes
+
+            # Execute a forward pass with dummy inputs to profile the memory usage
+            # of the model.
+            with profiler.track("determine_available_memory", "memory_profiling"):
+                with memory_profiling(
+                    self.init_snapshot,
+                    weights_memory=int(self.model_runner.model_memory_usage),
+                ) as profile_result:
+                    with profiler.track(
+                        "determine_available_memory", "profile_run"
+                    ):
+                        self.model_runner.profile_run()
+
+                    profile_torch_peak = torch.accelerator.memory_stats(
+                        self.device
+                    ).get("allocated_bytes.all.peak", 0)
+
+                    # Profile CUDA graph memory if graphs will be captured.
+                    # Skip on ROCm/HIP as graph pool handles and mem_get_info behave
+                    # differently and can produce incorrect/negative estimates.
+                    cudagraph_memory_estimate = 0
+                    if (
+                        not self.model_config.enforce_eager
+                        and not current_platform.is_rocm()
+                    ):
+                        with profiler.track(
+                            "determine_available_memory",
+                            "profile_cudagraph_memory",
+                        ):
+                            cudagraph_memory_estimate = (
+                                self.model_runner.profile_cudagraph_memory()
+                            )
+
+            # Use the pre-cudagraph torch peak to avoid double-counting.
+            profile_result.torch_peak_increase = (
+                profile_torch_peak - profile_result.before_profile.torch_peak
             )
-            logger.info(msg)
-            return kv_cache_memory_bytes
-
-        # Execute a forward pass with dummy inputs to profile the memory usage
-        # of the model.
-        with memory_profiling(
-            self.init_snapshot,
-            weights_memory=int(self.model_runner.model_memory_usage),
-        ) as profile_result:
-            self.model_runner.profile_run()
-
-            profile_torch_peak = torch.accelerator.memory_stats(self.device).get(
-                "allocated_bytes.all.peak", 0
+            profile_result.non_kv_cache_memory = (
+                profile_result.non_torch_increase
+                + profile_result.torch_peak_increase
+                + profile_result.weights_memory
             )
 
-            # Profile CUDA graph memory if graphs will be captured.
-            # Skip on ROCm/HIP as graph pool handles and mem_get_info behave
-            # differently and can produce incorrect/negative estimates.
-            cudagraph_memory_estimate = 0
-            if not self.model_config.enforce_eager and not current_platform.is_rocm():
-                cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
+            # On ROCm, cudagraph_memory_estimate is always 0 so this is a no-op.
+            # On CUDA, respect the opt-in flag as originally designed.
+            cudagraph_memory_estimate_applied = (
+                cudagraph_memory_estimate
+                if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+                else 0
+            )
 
-        # Use the pre-cudagraph torch peak to avoid double-counting.
-        profile_result.torch_peak_increase = (
-            profile_torch_peak - profile_result.before_profile.torch_peak
-        )
-        profile_result.non_kv_cache_memory = (
-            profile_result.non_torch_increase
-            + profile_result.torch_peak_increase
-            + profile_result.weights_memory
-        )
+            self.non_torch_memory = profile_result.non_torch_increase
+            self.peak_activation_memory = profile_result.torch_peak_increase
+            self.cudagraph_memory_estimate = cudagraph_memory_estimate
 
-        # On ROCm, cudagraph_memory_estimate is always 0 so this is a no-op.
-        # On CUDA, respect the opt-in flag as originally designed.
-        cudagraph_memory_estimate_applied = (
-            cudagraph_memory_estimate
-            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
-            else 0
-        )
+            free_gpu_memory = profile_result.after_profile.free_memory
+            # NOTE(woosuk): Here we assume that the other processes using the same
+            # GPU did not change their memory usage during the profiling.
+            assert self.init_snapshot.free_memory >= free_gpu_memory, (
+                "Error in memory profiling. "
+                f"Initial free memory {format_gib(self.init_snapshot.free_memory)} GiB, "
+                f"current free memory {format_gib(free_gpu_memory)} GiB. "
+                "This happens when other processes sharing the same container "
+                "release GPU memory while vLLM is profiling during initialization. "
+                "To fix this, ensure consistent GPU memory allocation or "
+                "isolate vLLM in its own container."
+            )
+            self.available_kv_cache_memory_bytes = (
+                self.requested_memory
+                - profile_result.non_kv_cache_memory
+                - cudagraph_memory_estimate_applied
+            )
 
-        self.non_torch_memory = profile_result.non_torch_increase
-        self.peak_activation_memory = profile_result.torch_peak_increase
-        self.cudagraph_memory_estimate = cudagraph_memory_estimate
+            unrequested_memory = (
+                self.init_snapshot.free_memory - self.requested_memory
+            )
+            logger.debug(
+                "Initial free memory: %s GiB; Requested memory: %f (util), %s GiB",
+                format_gib(self.init_snapshot.free_memory),
+                self.cache_config.gpu_memory_utilization,
+                format_gib(self.requested_memory),
+            )
+            logger.debug(
+                "Free memory after profiling: %s GiB (total), %s GiB (within requested)",
+                format_gib(free_gpu_memory),
+                format_gib(free_gpu_memory - unrequested_memory),
+            )
+            logger.debug(profile_result)
+            logger.info_once(
+                "Available KV cache memory: %s GiB",
+                format_gib(self.available_kv_cache_memory_bytes),
+                scope="local",
+            )
 
-        free_gpu_memory = profile_result.after_profile.free_memory
-        # NOTE(woosuk): Here we assume that the other processes using the same
-        # GPU did not change their memory usage during the profiling.
-        assert self.init_snapshot.free_memory >= free_gpu_memory, (
-            "Error in memory profiling. "
-            f"Initial free memory {format_gib(self.init_snapshot.free_memory)} GiB, "
-            f"current free memory {format_gib(free_gpu_memory)} GiB. "
-            "This happens when other processes sharing the same container "
-            "release GPU memory while vLLM is profiling during initialization. "
-            "To fix this, ensure consistent GPU memory allocation or "
-            "isolate vLLM in its own container."
-        )
-        self.available_kv_cache_memory_bytes = (
-            self.requested_memory
-            - profile_result.non_kv_cache_memory
-            - cudagraph_memory_estimate_applied
-        )
+            if cudagraph_memory_estimate > 0:
+                total_mem = self.init_snapshot.total_memory
+                current_util = self.cache_config.gpu_memory_utilization
+                cg_util_delta = cudagraph_memory_estimate / total_mem
+                if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:
+                    equiv_util = round(current_util - cg_util_delta, 4)
+                    suggested_util = min(
+                        round(current_util + cg_util_delta, 4),
+                        1.0,
+                    )
+                    logger.info(
+                        "CUDA graph memory profiling is enabled "
+                        "(VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1). "
+                        "This will become the default in v0.19. "
+                        "The current --gpu-memory-utilization=%.4f is equivalent "
+                        "to --gpu-memory-utilization=%.4f without CUDA graph "
+                        "memory profiling. To maintain the same effective KV "
+                        "cache size as before, increase "
+                        "--gpu-memory-utilization to %.4f.",
+                        current_util,
+                        equiv_util,
+                        suggested_util,
+                    )
+                else:
+                    suggested_util = min(
+                        round(current_util + cg_util_delta, 4),
+                        1.0,
+                    )
+                    logger.info(
+                        "In v0.19, CUDA graph memory profiling will be enabled "
+                        "by default (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1), "
+                        "which more accurately accounts for CUDA graph memory "
+                        "during KV cache allocation. To try it now, set "
+                        "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 and increase "
+                        "--gpu-memory-utilization from %.4f to %.4f to maintain "
+                        "the same effective KV cache size.",
+                        current_util,
+                        suggested_util,
+                    )
 
-        unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
-        logger.debug(
-            "Initial free memory: %s GiB; Requested memory: %f (util), %s GiB",
-            format_gib(self.init_snapshot.free_memory),
-            self.cache_config.gpu_memory_utilization,
-            format_gib(self.requested_memory),
-        )
-        logger.debug(
-            "Free memory after profiling: %s GiB (total), %s GiB (within requested)",
-            format_gib(free_gpu_memory),
-            format_gib(free_gpu_memory - unrequested_memory),
-        )
-        logger.debug(profile_result)
-        logger.info_once(
-            "Available KV cache memory: %s GiB",
-            format_gib(self.available_kv_cache_memory_bytes),
-            scope="local",
-        )
-
-        if cudagraph_memory_estimate > 0:
-            total_mem = self.init_snapshot.total_memory
-            current_util = self.cache_config.gpu_memory_utilization
-            cg_util_delta = cudagraph_memory_estimate / total_mem
-            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:
-                equiv_util = round(current_util - cg_util_delta, 4)
-                suggested_util = min(
-                    round(current_util + cg_util_delta, 4),
-                    1.0,
-                )
-                logger.info(
-                    "CUDA graph memory profiling is enabled "
-                    "(VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1). "
-                    "This will become the default in v0.19. "
-                    "The current --gpu-memory-utilization=%.4f is equivalent "
-                    "to --gpu-memory-utilization=%.4f without CUDA graph "
-                    "memory profiling. To maintain the same effective KV "
-                    "cache size as before, increase "
-                    "--gpu-memory-utilization to %.4f.",
-                    current_util,
-                    equiv_util,
-                    suggested_util,
-                )
-            else:
-                suggested_util = min(
-                    round(current_util + cg_util_delta, 4),
-                    1.0,
-                )
-                logger.info(
-                    "In v0.19, CUDA graph memory profiling will be enabled "
-                    "by default (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1), "
-                    "which more accurately accounts for CUDA graph memory "
-                    "during KV cache allocation. To try it now, set "
-                    "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 and increase "
-                    "--gpu-memory-utilization from %.4f to %.4f to maintain "
-                    "the same effective KV cache size.",
-                    current_util,
-                    suggested_util,
-                )
-
-        return int(self.available_kv_cache_memory_bytes)
+            return int(self.available_kv_cache_memory_bytes)
 
     def get_kv_connector_handshake_metadata(self) -> dict | None:
         """Get KV connector metadata from this worker if available."""
@@ -563,37 +612,39 @@ class Worker(WorkerBase):
     @instrument(span_name="Allocate KV cache")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
+        profiler = get_eep_profile(
+            rank=self.vllm_config.parallel_config.data_parallel_rank
+        )
 
-        # Update local config with adjusted num blocks after profiling,
-        # so that it's available to the warmup stage.
-        self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
+        with profiler.track("initialize_from_config", "total"):
+            self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
 
-        # Init kv cache connector here, because it requires
-        # `kv_cache_config`.
-        # NOTE(Kuntai): This need to be done before `initialize_kv_cache`,
-        # because `initialize_kv_cache` will inject kv cache groups not
-        # related to kv cache connector (e.g. kv cache sharing layers).
-        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+            with profiler.track(
+                "initialize_from_config", "ensure_kv_transfer_initialized"
+            ):
+                ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
 
-        if self.vllm_config.model_config.enable_sleep_mode:
-            from vllm.device_allocator.cumem import CuMemAllocator
+            with profiler.track("initialize_from_config", "initialize_kv_cache"):
+                if self.vllm_config.model_config.enable_sleep_mode:
+                    from vllm.device_allocator.cumem import CuMemAllocator
 
-            allocator = CuMemAllocator.get_instance()
-            with allocator.use_memory_pool(tag="kv_cache"):
-                self.model_runner.initialize_kv_cache(kv_cache_config)
-        else:
-            self.model_runner.initialize_kv_cache(kv_cache_config)
+                    allocator = CuMemAllocator.get_instance()
+                    with allocator.use_memory_pool(tag="kv_cache"):
+                        self.model_runner.initialize_kv_cache(kv_cache_config)
+                else:
+                    self.model_runner.initialize_kv_cache(kv_cache_config)
 
-        if self.model_config.enable_return_routed_experts:
-            self.model_runner.init_routed_experts_capturer()
+            if self.model_config.enable_return_routed_experts:
+                with profiler.track(
+                    "initialize_from_config", "init_routed_experts_capturer"
+                ):
+                    self.model_runner.init_routed_experts_capturer()
 
-        # Build KV-zero metadata outside the CuMem pool so the bookkeeping
-        # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch
-        # allocator and are not discarded during sleep/wake cycles.
-        if kv_cache_config.needs_kv_cache_zeroing and hasattr(
-            self.model_runner, "_init_kv_zero_meta"
-        ):
-            self.model_runner._init_kv_zero_meta()
+            if kv_cache_config.needs_kv_cache_zeroing and hasattr(
+                self.model_runner, "_init_kv_zero_meta"
+            ):
+                with profiler.track("initialize_from_config", "init_kv_zero_meta"):
+                    self.model_runner._init_kv_zero_meta()
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> float:
@@ -934,6 +985,19 @@ class Worker(WorkerBase):
             self.profiler.stop()
 
     def execute_dummy_batch(self) -> None:
+        # if self._sync_only_sleep_active:
+        #     num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
+        #     logger.info(
+        #         "[sleep-debug] execute_dummy_batch using DP-only sync path: "
+        #         "ep_rank=%s dp_rank=%s num_tokens=%s",
+        #         get_ep_group().rank,
+        #         self.parallel_config.data_parallel_rank,
+        #         num_tokens,
+        #     )
+        #     self.model_runner.sync_sleep_rank_across_dp(num_tokens)
+        #     return
+        # # if self._skip_dummy_batch:
+        # #     return
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
         self.model_runner._dummy_run(num_tokens, uniform_decode=True)
 

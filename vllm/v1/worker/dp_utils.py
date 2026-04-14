@@ -51,7 +51,22 @@ def _run_ar(
     tensor[1][dp_rank] = padded_num_tokens_per_ubatch
     tensor[2][dp_rank] = 1 if should_ubatch else 0
     tensor[3][dp_rank] = cudagraph_mode
+    logger.info(
+        "[sleep-debug] before DP all_reduce: dp_rank=%s orig_tokens=%s "
+        "padded_tokens=%s should_ubatch=%s cudagraph_mode=%s device=%s",
+        dp_rank,
+        orig_num_tokens_per_ubatch,
+        padded_num_tokens_per_ubatch,
+        should_ubatch,
+        cudagraph_mode,
+        device,
+    )
     dist.all_reduce(tensor, group=group)
+    logger.info(
+        "[sleep-debug] after DP all_reduce: dp_rank=%s tensor=%s",
+        dp_rank,
+        tensor.cpu(),
+    )
     return tensor
 
 
@@ -225,5 +240,5 @@ def coordinate_batch_across_dp(
             parallel_config,
         )
     )
-
+    print(f"[coordinate_batch_across_dp]my dp rank: {parallel_config.data_parallel_rank}  should_ubatch: {should_ubatch}  num_tokens_after_padding: {num_tokens_after_padding}  synced_cudagraph_mode: {synced_cudagraph_mode}")
     return (should_ubatch, num_tokens_after_padding, synced_cudagraph_mode)

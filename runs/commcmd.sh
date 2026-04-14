@@ -1,5 +1,5 @@
 
-export CUDA_VISIBLE_DEVICES=0,4
+# export CUDA_VISIBLE_DEVICES=0,4
 
 VLLM_SERVER_DEV_MODE=1 vllm serve /mnt/nvme/fyf/models/DeepSeek-V2-Lite   --trust-remote-code   --tensor-parallel-size 1   --data-parallel-size 2   --api-server-count 1   --enable-expert-parallel   --enable-eplb   --eplb-config.num_redundant_experts 64   --enable-sleep-mode   --enforce-eager --port 8005 --gpu-memory-utilization 0.5
 
@@ -15,7 +15,7 @@ curl -X POST "http://127.0.0.1:8005/v1/chat/completions"   -H "Content-Type: app
   }'
 
 
-curl -X POST "http://127.0.0.1:8005/v1/chat/completions"   -H "Content-Type: application/json"   -H "Authorization: Bearer EMPTY"  -H "X-data-parallel-rank: 1" -d '{
+curl -X POST "http://127.0.0.1:8005/v1/chat/completions"   -H "Content-Type: application/json"   -H "Authorization: Bearer EMPTY"  -H "X-data-parallel-rank: 0" -d '{
     "model": "/mnt/nvme/fyf/models/DeepSeek-V2-Lite",
     "messages": [
       {"role": "user", "content": "Hello"}

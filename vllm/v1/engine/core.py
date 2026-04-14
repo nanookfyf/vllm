@@ -98,6 +98,9 @@ class EngineCore:
         executor_fail_callback: Callable | None = None,
         include_finished_set: bool = False,
     ):
+        profiler = get_eep_profile(
+            rank=vllm_config.parallel_config.data_parallel_rank
+        )
         # plugins need to be loaded at the engine/scheduler level too
         from vllm.plugins import load_general_plugins
 
@@ -113,120 +116,132 @@ class EngineCore:
 
         self.log_stats = log_stats
 
-        # Setup Model.
-        self.model_executor = executor_class(vllm_config)
-        if executor_fail_callback is not None:
-            self.model_executor.register_failure_callback(executor_fail_callback)
+        with profiler.track("engine_core_init", "total"):
+            # Setup Model.
+            with profiler.track("engine_core_init", "create_executor"):
+                self.model_executor = executor_class(vllm_config)
+                if executor_fail_callback is not None:
+                    self.model_executor.register_failure_callback(
+                        executor_fail_callback
+                    )
 
-        self.available_gpu_memory_for_kv_cache = -1
+            self.available_gpu_memory_for_kv_cache = -1
 
-        if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
-            self._eep_scale_up_before_kv_init()
+            if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+                with profiler.track("engine_core_init", "scale_up_before_kv_init"):
+                    self._eep_scale_up_before_kv_init()
 
-        # Setup KV Caches and update CacheConfig after profiling.
-        kv_cache_config = self._initialize_kv_caches(vllm_config)
-        self.structured_output_manager = StructuredOutputManager(vllm_config)
+            # Setup KV Caches and update CacheConfig after profiling.
+            with profiler.track("engine_core_init", "initialize_kv_caches"):
+                kv_cache_config = self._initialize_kv_caches(vllm_config)
+            self.structured_output_manager = StructuredOutputManager(vllm_config)
 
-        # Setup scheduler.
-        Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
+            # Setup scheduler.
+            with profiler.track("engine_core_init", "create_scheduler"):
+                Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
 
-        if len(kv_cache_config.kv_cache_groups) == 0:  # noqa: SIM102
-            # Encoder models without KV cache don't support
-            # chunked prefill. But do SSM models?
-            if vllm_config.scheduler_config.enable_chunked_prefill:
-                logger.warning("Disabling chunked prefill for model without KVCache")
-                vllm_config.scheduler_config.enable_chunked_prefill = False
+                if len(kv_cache_config.kv_cache_groups) == 0:  # noqa: SIM102
+                    # Encoder models without KV cache don't support
+                    # chunked prefill. But do SSM models?
+                    if vllm_config.scheduler_config.enable_chunked_prefill:
+                        logger.warning(
+                            "Disabling chunked prefill for model without KVCache"
+                        )
+                        vllm_config.scheduler_config.enable_chunked_prefill = False
 
-        scheduler_block_size = (
-            vllm_config.cache_config.block_size
-            * vllm_config.parallel_config.decode_context_parallel_size
-            * vllm_config.parallel_config.prefill_context_parallel_size
-        )
+                scheduler_block_size = (
+                    vllm_config.cache_config.block_size
+                    * vllm_config.parallel_config.decode_context_parallel_size
+                    * vllm_config.parallel_config.prefill_context_parallel_size
+                )
 
-        self.scheduler: SchedulerInterface = Scheduler(
-            vllm_config=vllm_config,
-            kv_cache_config=kv_cache_config,
-            structured_output_manager=self.structured_output_manager,
-            include_finished_set=include_finished_set,
-            log_stats=self.log_stats,
-            block_size=scheduler_block_size,
-        )
-        self.use_spec_decode = vllm_config.speculative_config is not None
-        if self.scheduler.connector is not None:  # type: ignore
-            self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
+                self.scheduler: SchedulerInterface = Scheduler(
+                    vllm_config=vllm_config,
+                    kv_cache_config=kv_cache_config,
+                    structured_output_manager=self.structured_output_manager,
+                    include_finished_set=include_finished_set,
+                    log_stats=self.log_stats,
+                    block_size=scheduler_block_size,
+                )
+                self.use_spec_decode = vllm_config.speculative_config is not None
+                if self.scheduler.connector is not None:  # type: ignore
+                    self.model_executor.init_kv_output_aggregator(  # type: ignore
+                        self.scheduler.connector
+                    )
 
-        mm_registry = MULTIMODAL_REGISTRY
-        self.mm_receiver_cache = mm_registry.engine_receiver_cache_from_config(
-            vllm_config
-        )
+            with profiler.track("engine_core_init", "init_mm_receiver_cache"):
+                mm_registry = MULTIMODAL_REGISTRY
+                self.mm_receiver_cache = mm_registry.engine_receiver_cache_from_config(
+                    vllm_config
+                )
 
-        # If a KV connector is initialized for scheduler, we want to collect
-        # handshake metadata from all workers so the connector in the scheduler
-        # will have the full context
-        kv_connector = self.scheduler.get_kv_connector()
-        if kv_connector is not None:
-            # Collect and store KV connector xfer metadata from workers
-            # (after KV cache registration)
-            xfer_handshake_metadata = (
-                self.model_executor.get_kv_connector_handshake_metadata()
+            # If a KV connector is initialized for scheduler, we want to collect
+            # handshake metadata from all workers so the connector in the scheduler
+            # will have the full context
+            kv_connector = self.scheduler.get_kv_connector()
+            if kv_connector is not None:
+                with profiler.track(
+                    "engine_core_init", "collect_kv_connector_metadata"
+                ):
+                    xfer_handshake_metadata = (
+                        self.model_executor.get_kv_connector_handshake_metadata()
+                    )
+
+                    if xfer_handshake_metadata:
+                        content: dict[int, Any] = {}
+                        for worker_dict in xfer_handshake_metadata:
+                            if worker_dict is not None:
+                                content.update(worker_dict)
+                        kv_connector.set_xfer_handshake_metadata(content)
+
+            # Setup batch queue for pipeline parallelism.
+            with profiler.track("engine_core_init", "setup_batch_queue"):
+                self.batch_queue_size = self.model_executor.max_concurrent_batches
+                self.batch_queue: (
+                    deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
+                ) = None
+                if self.batch_queue_size > 1:
+                    logger.debug(
+                        "Batch queue is enabled with size %d", self.batch_queue_size
+                    )
+                    self.batch_queue = deque(maxlen=self.batch_queue_size)
+
+            self.is_ec_consumer = (
+                vllm_config.ec_transfer_config is None
+                or vllm_config.ec_transfer_config.is_ec_consumer
             )
+            self.is_pooling_model = vllm_config.model_config.runner_type == "pooling"
 
-            if xfer_handshake_metadata:
-                # xfer_handshake_metadata is list of dicts from workers
-                # Each dict already has structure {tp_rank: metadata}
-                # Merge all worker dicts into a single dict
-                content: dict[int, Any] = {}
-                for worker_dict in xfer_handshake_metadata:
-                    if worker_dict is not None:
-                        content.update(worker_dict)
-                kv_connector.set_xfer_handshake_metadata(content)
+            self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
+            if (
+                vllm_config.cache_config.enable_prefix_caching
+                or kv_connector is not None
+            ):
+                with profiler.track("engine_core_init", "init_request_block_hasher"):
+                    caching_hash_fn = get_hash_fn_by_name(
+                        vllm_config.cache_config.prefix_caching_hash_algo
+                    )
+                    init_none_hash(caching_hash_fn)
 
-        # Setup batch queue for pipeline parallelism.
-        # Batch queue for scheduled batches. This enables us to asynchronously
-        # schedule and execute batches, and is required by pipeline parallelism
-        # to eliminate pipeline bubbles.
-        self.batch_queue_size = self.model_executor.max_concurrent_batches
-        self.batch_queue: (
-            deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
-        ) = None
-        if self.batch_queue_size > 1:
-            logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
-            self.batch_queue = deque(maxlen=self.batch_queue_size)
+                    self.request_block_hasher = get_request_block_hasher(
+                        scheduler_block_size, caching_hash_fn
+                    )
 
-        self.is_ec_consumer = (
-            vllm_config.ec_transfer_config is None
-            or vllm_config.ec_transfer_config.is_ec_consumer
-        )
-        self.is_pooling_model = vllm_config.model_config.runner_type == "pooling"
-
-        self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
-        if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:
-            caching_hash_fn = get_hash_fn_by_name(
-                vllm_config.cache_config.prefix_caching_hash_algo
+            self.step_fn = (
+                self.step if self.batch_queue is None else self.step_with_batch_queue
             )
-            init_none_hash(caching_hash_fn)
+            self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
-            self.request_block_hasher = get_request_block_hasher(
-                scheduler_block_size, caching_hash_fn
-            )
+            self.aborts_queue = queue.Queue[list[str]]()
 
-        self.step_fn = (
-            self.step if self.batch_queue is None else self.step_with_batch_queue
-        )
-        self.async_scheduling = vllm_config.scheduler_config.async_scheduling
+            self._idle_state_callbacks: list[Callable] = []
 
-        self.aborts_queue = queue.Queue[list[str]]()
-
-        self._idle_state_callbacks: list[Callable] = []
-
-        # Mark the startup heap as static so that it's ignored by GC.
-        # Reduces pause times of oldest generation collections.
-        freeze_gc_heap()
-        # If enable, attach GC debugger after static variable freeze.
-        maybe_attach_gc_debug_callback()
-        # Enable environment variable cache (e.g. assume no more
-        # environment variable overrides after this point)
-        enable_envs_cache()
+            with profiler.track("engine_core_init", "finalize_runtime"):
+                # Mark the startup heap as static so that it's ignored by GC.
+                # Reduces pause times of oldest generation collections.
+                freeze_gc_heap()
+                maybe_attach_gc_debug_callback()
+                enable_envs_cache()
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
@@ -797,6 +812,9 @@ class EngineCoreProc(EngineCore):
         *,
         engine_index: int = 0,
     ):
+        profiler = get_eep_profile(
+            rank=vllm_config.parallel_config.data_parallel_rank
+        )
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
         self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
         executor_fail_callback = lambda: self.input_queue.put_nowait(
@@ -814,84 +832,90 @@ class EngineCoreProc(EngineCore):
             self.tensor_ipc_receiver = TensorIpcReceiver(tensor_queue)
             logger.info("Using tensor IPC queue for multimodal tensor sharing")
 
-        with self._perform_handshakes(
-            handshake_address,
-            identity,
-            local_client,
-            vllm_config,
-            client_handshake_address,
-        ) as addresses:
-            # Set up data parallel environment.
-            self.has_coordinator = addresses.coordinator_output is not None
-            self.frontend_stats_publish_address = (
-                addresses.frontend_stats_publish_address
-            )
-            logger.debug(
-                "Has DP Coordinator: %s, stats publish address: %s",
-                self.has_coordinator,
-                self.frontend_stats_publish_address,
-            )
-            internal_dp_balancing = (
-                self.has_coordinator
-                and not vllm_config.parallel_config.data_parallel_external_lb
-            )
-            # Only publish request queue stats to coordinator for "internal"
-            # and "hybrid" LB modes.
-            self.publish_dp_lb_stats = internal_dp_balancing
-
-            self.addresses = addresses
-            self.process_input_queue_block = True
-            if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
-                self._eep_send_engine_core_notification(
-                    EEPNotificationType.NEW_CORE_ENGINES_INIT_READY,
-                    vllm_config=vllm_config,
-                )
-            self._init_data_parallel(vllm_config)
-
-            super().__init__(
-                vllm_config,
-                executor_class,
-                log_stats,
-                executor_fail_callback,
-                internal_dp_balancing,
-            )
-
-            # Background Threads and Queues for IO. These enable us to
-            # overlap ZMQ socket IO with GPU since they release the GIL,
-            # and to overlap some serialization/deserialization with the
-            # model forward pass.
-            # Threads handle Socket <-> Queues and core_busy_loop uses Queue.
-            ready_event = threading.Event()
-            input_thread = threading.Thread(
-                target=self.process_input_sockets,
-                args=(
-                    addresses.inputs,
-                    addresses.coordinator_input,
+        with profiler.track("engine_core_proc_init", "total"):
+            with profiler.track("engine_core_proc_init", "perform_handshakes"):
+                with self._perform_handshakes(
+                    handshake_address,
                     identity,
-                    ready_event,
-                ),
-                daemon=True,
-            )
-            input_thread.start()
+                    local_client,
+                    vllm_config,
+                    client_handshake_address,
+                ) as addresses:
+                    # Set up data parallel environment.
+                    self.has_coordinator = addresses.coordinator_output is not None
+                    self.frontend_stats_publish_address = (
+                        addresses.frontend_stats_publish_address
+                    )
+                    logger.debug(
+                        "Has DP Coordinator: %s, stats publish address: %s",
+                        self.has_coordinator,
+                        self.frontend_stats_publish_address,
+                    )
+                    internal_dp_balancing = (
+                        self.has_coordinator
+                        and not vllm_config.parallel_config.data_parallel_external_lb
+                    )
+                    self.publish_dp_lb_stats = internal_dp_balancing
 
-            self.output_thread = threading.Thread(
-                target=self.process_output_sockets,
-                args=(
-                    addresses.outputs,
-                    addresses.coordinator_output,
-                    self.engine_index,
-                ),
-                daemon=True,
-            )
-            self.output_thread.start()
+                    self.addresses = addresses
+                    self.process_input_queue_block = True
+                    if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+                        self._eep_send_engine_core_notification(
+                            EEPNotificationType.NEW_CORE_ENGINES_INIT_READY,
+                            vllm_config=vllm_config,
+                        )
+                    with profiler.track("engine_core_proc_init", "init_data_parallel"):
+                        self._init_data_parallel(vllm_config)
 
-            # Don't complete handshake until DP coordinator ready message is
-            # received.
-            while not ready_event.wait(timeout=10):
-                if not input_thread.is_alive():
-                    raise RuntimeError("Input socket thread died during startup")
-                assert addresses.coordinator_input is not None
-                logger.info("Waiting for READY message from DP Coordinator...")
+                    with profiler.track(
+                        "engine_core_proc_init", "engine_core_super_init"
+                    ):
+                        super().__init__(
+                            vllm_config,
+                            executor_class,
+                            log_stats,
+                            executor_fail_callback,
+                            internal_dp_balancing,
+                        )
+
+                    ready_event = threading.Event()
+                    with profiler.track("engine_core_proc_init", "start_input_thread"):
+                        input_thread = threading.Thread(
+                            target=self.process_input_sockets,
+                            args=(
+                                addresses.inputs,
+                                addresses.coordinator_input,
+                                identity,
+                                ready_event,
+                            ),
+                            daemon=True,
+                        )
+                        input_thread.start()
+
+                    with profiler.track("engine_core_proc_init", "start_output_thread"):
+                        self.output_thread = threading.Thread(
+                            target=self.process_output_sockets,
+                            args=(
+                                addresses.outputs,
+                                addresses.coordinator_output,
+                                self.engine_index,
+                            ),
+                            daemon=True,
+                        )
+                        self.output_thread.start()
+
+                    with profiler.track(
+                        "engine_core_proc_init", "wait_dp_coordinator_ready"
+                    ):
+                        while not ready_event.wait(timeout=10):
+                            if not input_thread.is_alive():
+                                raise RuntimeError(
+                                    "Input socket thread died during startup"
+                                )
+                            assert addresses.coordinator_input is not None
+                            logger.info(
+                                "Waiting for READY message from DP Coordinator..."
+                            )
 
     @contextmanager
     def _perform_handshakes(
@@ -2017,14 +2041,17 @@ class DPMoEEngineCoreActor(EngineCoreActorMixin, DPEngineCoreProc):
         dp_rank: int = 0,
         local_dp_rank: int = 0,
     ):
+        profiler = get_eep_profile(rank=dp_rank)
         vllm_config.parallel_config.data_parallel_rank = dp_rank
-
-        EngineCoreActorMixin.__init__(
-            self, vllm_config, addresses, dp_rank, local_dp_rank
-        )
-        DPEngineCoreProc.__init__(
-            self, vllm_config, local_client, "", executor_class, log_stats
-        )
+        with profiler.track("engine_core_actor_init", "total"):
+            with profiler.track("engine_core_actor_init", "mixin_init"):
+                EngineCoreActorMixin.__init__(
+                    self, vllm_config, addresses, dp_rank, local_dp_rank
+                )
+            with profiler.track("engine_core_actor_init", "engine_core_proc_init"):
+                DPEngineCoreProc.__init__(
+                    self, vllm_config, local_client, "", executor_class, log_stats
+                )
 
 
 class EngineCoreActor(EngineCoreActorMixin, EngineCoreProc):

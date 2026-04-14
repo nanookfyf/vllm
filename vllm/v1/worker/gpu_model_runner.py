@@ -39,6 +39,7 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
     get_dcp_group,
+    get_ep_group,
     get_pp_group,
     get_tp_group,
     graph_capture,
@@ -507,6 +508,12 @@ class GPUModelRunner(
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
 
         self.use_aux_hidden_state_outputs = False
+        # Sleeping EP ranks may still need to participate in lightweight DP
+        # batch-shape coordination, but should not run a real dummy forward.
+        self.sync_only_sleep_active = False
+        # CuMem sleep offloaded model weight pools; running the model would be
+        # invalid until the matching tags are woken.
+        self.skip_dummy_model_forward: bool = False
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
@@ -1785,28 +1792,64 @@ class GPUModelRunner(
 
     def retag_sleep_mode_weights(self) -> None:
         """Split sleep-mode weight allocations into shared/expert buckets."""
+        #logger.info("retag_sleep_mode_weights")
+
         if not self.vllm_config.model_config.enable_sleep_mode:
+            logger.info("retag_sleep_mode_weights: enable_sleep_mode is False")
             return
 
         model = self.get_model()
         if not is_mixture_of_experts(model):
+            logger.info("retag_sleep_mode_weights: not is_mixture_of_experts")
             return
 
         from vllm.device_allocator.cumem import CuMemAllocator
 
-        allocator = CuMemAllocator.get_instance()
-        allocator.rename_tag("weights", "shared_weights")
-
-        expert_ptrs: set[int] = set()
-        for weight_group in model.expert_weights:
-            for weight in weight_group:
-                expert_ptrs.add(weight.data_ptr())
+        def _collect_ptrs(tensors: Iterable[torch.Tensor]) -> set[int]:
+            ptrs: set[int] = set()
+            for tensor in tensors:
+                ptrs.add(tensor.data_ptr())
                 try:
-                    expert_ptrs.add(weight.untyped_storage().data_ptr())
+                    ptrs.add(tensor.untyped_storage().data_ptr())
                 except RuntimeError:
                     pass
+            return ptrs
 
-        allocator.retag_allocations_by_ptrs(expert_ptrs, "expert_weights")
+        allocator = CuMemAllocator.get_instance()
+        renamed = allocator.rename_tag("weights", "shared_weights")
+
+        expert_tensors: list[torch.Tensor] = []
+        for weight_group in model.expert_weights:
+            expert_tensors.extend(weight_group)
+
+        expert_ptrs = _collect_ptrs(expert_tensors)
+        retagged_expert_allocations = allocator.retag_allocations_by_ptrs(
+            expert_ptrs, "expert_weights"
+        )
+
+        eplb_buffer_tensors: list[torch.Tensor] = []
+        if self.eplb_state is not None:
+            for model_state in self.eplb_state.model_states.values():
+                eplb_buffer_tensors.extend(model_state.expert_buffer)
+
+        eplb_buffer_ptrs = _collect_ptrs(eplb_buffer_tensors)
+        retagged_eplb_buffer_allocations = allocator.retag_allocations_by_ptrs(
+            eplb_buffer_ptrs, "expert_weights"
+        )
+
+        logger.info(
+            "retag_sleep_mode_weights: renamed %s allocations to shared_weights; "
+            "expert tensors=%s expert ptrs=%s retagged expert allocations=%s; "
+            "eplb expert buffers=%s eplb ptrs=%s retagged eplb buffer "
+            "allocations=%s",
+            renamed,
+            len(expert_tensors),
+            len(expert_ptrs),
+            retagged_expert_allocations,
+            len(eplb_buffer_tensors),
+            len(eplb_buffer_ptrs),
+            retagged_eplb_buffer_allocations,
+        )
 
     def _prepare_inputs(
         self,
@@ -3856,6 +3899,15 @@ class GPUModelRunner(
                     # returns True. before returning early here we call
                     # dummy run to ensure coordinate_batch_across_dp
                     # is called into to avoid out of sync issues.
+                    # if self.sync_only_sleep_active:
+                    #     logger.info(
+                    #         "[sleep-debug] sync-only rank entering DP-only dummy sync: "
+                    #         "dp_rank=%s",
+                    #         self.parallel_config.data_parallel_rank,
+                    #     )
+                    #     self.sync_sleep_rank_across_dp()
+                    # else:
+                    #     self._dummy_run(1)
                     self._dummy_run(1)
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if no work to do.
@@ -5442,6 +5494,22 @@ class GPUModelRunner(
                     use_spec_decode=self.speculative_config is not None,
                 )
 
+        _sleep_skip_forward = (
+            self.sync_only_sleep_active or self.skip_dummy_model_forward
+        )
+        # # MoE EP: all ranks in the EP group enter the same expert collectives inside
+        # # self.model(). If this rank skips the forward while a sibling EP rank still
+        # # runs it, that peer blocks in NCCL while we may already be in the next DP
+        # # coordinate — classic cross-lock (see shm_broadcast timeout after sleep).
+        # if _sleep_skip_forward and get_ep_group().world_size > 1:
+        #     logger.warning_once(
+        #         "Not skipping dummy model forward: EP world_size=%d > 1; skipping "
+        #         "only on some EP ranks would deadlock MoE collectives for peers.",
+        #         get_ep_group().world_size,
+        #         scope="local",
+        #     )
+        #     _sleep_skip_forward = False
+
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
             num_scheduled_tokens,
@@ -5511,23 +5579,33 @@ class GPUModelRunner(
                     slot_mapping=slot_mappings,
                 ),
             ):
-                outputs = self.model(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
-                )
+                if not _sleep_skip_forward:
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs,
+                    )
+                else:
+                    outputs = None
 
-            if self.use_aux_hidden_state_outputs:
-                hidden_states, _ = outputs
+            if outputs is not None:
+                if self.use_aux_hidden_state_outputs:
+                    hidden_states, _ = outputs
+                else:
+                    hidden_states = outputs
             else:
-                hidden_states = outputs
+                hidden_states = None
 
-            if self.speculative_config and (
-                self.speculative_config.use_eagle()
-                or self.speculative_config.uses_draft_model()
-                or self.speculative_config.uses_extract_hidden_states()
+            if (
+                not _sleep_skip_forward
+                and self.speculative_config
+                and (
+                    self.speculative_config.use_eagle()
+                    or self.speculative_config.uses_draft_model()
+                    or self.speculative_config.uses_extract_hidden_states()
+                )
             ):
                 assert isinstance(
                     self.drafter,
@@ -5568,6 +5646,11 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings,
                 )
 
+        # EP ranks that skip the dummy forward must not reach eplb_step before
+        # peers finish self.model, or EPLB collectives deadlock / diverge.
+        # if get_ep_group().world_size > 1:
+        #     get_ep_group().barrier()
+
         # We register layerwise NVTX hooks here after the first dynamo tracing is
         # done to avoid nvtx operations in hook functions being traced by
         # torch dynamo and causing graph breaks.
@@ -5589,6 +5672,14 @@ class GPUModelRunner(
         if not skip_eplb:
             self.eplb_step(is_dummy=True, is_profile=is_profile)
 
+        if _sleep_skip_forward:
+            logger.info(
+                "Dummy run skipped model/drafter (sync-only EP sleep or CuMem "
+                "weight offload); returning empty hidden states."
+            )
+            return torch.tensor([]), torch.tensor([])
+
+        assert hidden_states is not None
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
         logit_indices_device = torch.from_numpy(logit_indices).to(
             self.device, non_blocking=True
@@ -6321,7 +6412,19 @@ class GPUModelRunner(
         model = self.get_model()
         assert is_mixture_of_experts(model), "Logical EP sleep requires an MoE model."
         self.eplb_state.restore_logical_sleep()
-        
+    # FYF 修改 [只同步 不执行]
+    def sync_sleep_rank_across_dp(self, num_tokens: int = 1) -> None:
+        if self.parallel_config.data_parallel_size <= 1:
+            return
+        print(f"[sync_sleep_rank_across_dp]my dp rank: {self.parallel_config.data_parallel_rank}  sync_sleep_rank_across_dp: {num_tokens}")
+        coordinate_batch_across_dp(
+            num_tokens_unpadded=num_tokens,
+            parallel_config=self.parallel_config,
+            allow_microbatching=False,
+            num_tokens_padded=num_tokens,
+            cudagraph_mode=CUDAGraphMode.NONE.value,
+        )
+
 
     def _check_and_update_cudagraph_mode(
         self,

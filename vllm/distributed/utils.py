@@ -29,6 +29,7 @@ from torch.distributed.distributed_c10d import (
 from torch.distributed.rendezvous import rendezvous
 
 import vllm.envs as envs
+from vllm.distributed.elastic_ep.profile import get_eep_profile
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_tcp_uri
 from vllm.utils.system_utils import suppress_stdout
@@ -570,53 +571,61 @@ def stateless_init_torch_distributed_process_group(
     init_method = get_tcp_uri(host, port)
     backend = Backend(backend)  # it is basically string
     timeout = _get_default_timeout(backend)
+    profiler = get_eep_profile(rank=rank)
 
-    if listen_socket is not None:
-        store = create_tcp_store(
-            host,
-            port,
-            listen_socket=listen_socket,
-            world_size=world_size,
-            is_master=True,
-            timeout=timeout,
-            multi_tenant=True,
-        )
-    else:
-        store, rank, world_size = next(
-            rendezvous(init_method, rank, world_size, timeout=timeout)
-        )
-    store.set_timeout(timeout)
+    with profiler.track("stateless_init_pg", "total"):
+        if listen_socket is not None:
+            with profiler.track("stateless_init_pg", "create_tcp_store"):
+                store = create_tcp_store(
+                    host,
+                    port,
+                    listen_socket=listen_socket,
+                    world_size=world_size,
+                    is_master=True,
+                    timeout=timeout,
+                    multi_tenant=True,
+                )
+        else:
+            with profiler.track("stateless_init_pg", "rendezvous"):
+                store, rank, world_size = next(
+                    rendezvous(init_method, rank, world_size, timeout=timeout)
+                )
+        store.set_timeout(timeout)
 
-    group_rank = rank
-    group_size = world_size
+        group_rank = rank
+        group_size = world_size
 
-    # Use a PrefixStore to avoid accidental overrides of keys used by
-    # different systems (e.g. RPC) in case the store is multi-tenant.
-    prefix_store = PrefixStore(init_method, store)
+        # Use a PrefixStore to avoid accidental overrides of keys used by
+        # different systems (e.g. RPC) in case the store is multi-tenant.
+        with profiler.track("stateless_init_pg", "prefix_store"):
+            prefix_store = PrefixStore(init_method, store)
 
-    if backend == "gloo":
-        pg = init_gloo_process_group(
-            prefix_store=prefix_store,
-            group_rank=group_rank,
-            group_size=group_size,
-            timeout=timeout,
-        )
-    else:
-        from vllm.platforms import current_platform
+        if backend == "gloo":
+            with profiler.track("stateless_init_pg", "init_gloo_pg"):
+                pg = init_gloo_process_group(
+                    prefix_store=prefix_store,
+                    group_rank=group_rank,
+                    group_size=group_size,
+                    timeout=timeout,
+                )
+        else:
+            from vllm.platforms import current_platform
 
-        pg = current_platform.stateless_init_device_torch_dist_pg(
-            backend=backend,
-            prefix_store=prefix_store,
-            group_rank=group_rank,
-            group_size=group_size,
-            timeout=timeout,
-        )
+            with profiler.track("stateless_init_pg", "init_device_pg"):
+                pg = current_platform.stateless_init_device_torch_dist_pg(
+                    backend=backend,
+                    prefix_store=prefix_store,
+                    group_rank=group_rank,
+                    group_size=group_size,
+                    timeout=timeout,
+                )
 
-    if group_name is not None:
-        from torch._C._distributed_c10d import _register_process_group
+        if group_name is not None:
+            from torch._C._distributed_c10d import _register_process_group
 
-        pg._set_group_name(group_name)
-        _register_process_group(group_name, pg)
+            with profiler.track("stateless_init_pg", "register_pg"):
+                pg._set_group_name(group_name)
+                _register_process_group(group_name, pg)
 
     if return_store:
         return pg, store

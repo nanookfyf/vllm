@@ -7,6 +7,7 @@ from typing import Any, Optional
 import torch
 from torch.distributed import Backend, ProcessGroup, Store
 
+from vllm.distributed.elastic_ep.profile import get_eep_profile
 from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
@@ -83,6 +84,7 @@ class StatelessGroupCoordinator(GroupCoordinator):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
         _register_group(self)
+        profiler = get_eep_profile(rank=global_rank)
 
         self.rank = global_rank
         self.local_rank = local_rank
@@ -95,13 +97,25 @@ class StatelessGroupCoordinator(GroupCoordinator):
 
         backend = str(torch_distributed_backend)
         self.backend = backend
-        for idx, ranks in enumerate(group_ranks):
-            if self.rank in ranks:
-                self.ranks = ranks
-                self.world_size = len(ranks)
-                self.rank_in_group = ranks.index(self.rank)
+        with profiler.track("stateless_group_init", f"{group_name}.total"):
+            with profiler.track("stateless_group_init", f"{group_name}.match_local_group"):
+                matched_group_idx = None
+                matched_ranks: list[int] | None = None
+                for idx, ranks in enumerate(group_ranks):
+                    if self.rank in ranks:
+                        matched_group_idx = idx
+                        matched_ranks = ranks
+                        break
 
-                key = f"{group_name}_{idx}"
+            assert matched_group_idx is not None
+            assert matched_ranks is not None
+
+            self.ranks = matched_ranks
+            self.world_size = len(matched_ranks)
+            self.rank_in_group = matched_ranks.index(self.rank)
+
+            key = f"{group_name}_{matched_group_idx}"
+            with profiler.track("stateless_group_init", f"{group_name}.ports"):
                 if self.rank_in_group == 0:
                     ports, socks = _allocate_group_ports(
                         key,
@@ -111,8 +125,9 @@ class StatelessGroupCoordinator(GroupCoordinator):
                 else:
                     ports = _fetch_group_ports(key, coord_store)
                     socks = []
-                device_port, cpu_port, tcp_store_port = ports
+            device_port, cpu_port, tcp_store_port = ports
 
+            with profiler.track("stateless_group_init", f"{group_name}.device_pg"):
                 device_group = stateless_init_torch_distributed_process_group(
                     host=host,
                     port=device_port,
@@ -122,6 +137,7 @@ class StatelessGroupCoordinator(GroupCoordinator):
                     group_name=f"{self.unique_name}_device",
                     listen_socket=socks[0] if socks else None,
                 )
+            with profiler.track("stateless_group_init", f"{group_name}.cpu_pg"):
                 cpu_group = stateless_init_torch_distributed_process_group(
                     host=host,
                     port=cpu_port,
@@ -131,6 +147,7 @@ class StatelessGroupCoordinator(GroupCoordinator):
                     group_name=f"{self.unique_name}_cpu",
                     listen_socket=socks[1] if socks else None,
                 )
+            with profiler.track("stateless_group_init", f"{group_name}.tcp_store_group"):
                 tcp_store_group = StatelessProcessGroup.create(
                     host=host,
                     port=tcp_store_port,
@@ -139,9 +156,9 @@ class StatelessGroupCoordinator(GroupCoordinator):
                     listen_socket=socks[2] if socks else None,
                 )
 
-                self_device_group = device_group
-                self_cpu_group = cpu_group
-                self_tcp_store_group = tcp_store_group
+            self_device_group = device_group
+            self_cpu_group = cpu_group
+            self_tcp_store_group = tcp_store_group
 
         assert self_cpu_group is not None
         assert self_device_group is not None
@@ -163,19 +180,20 @@ class StatelessGroupCoordinator(GroupCoordinator):
         self.use_device_communicator = use_device_communicator
         self.device_communicator = None
         if use_device_communicator and self.world_size > 1:
-            device_comm_cls = resolve_obj_by_qualname(
-                current_platform.get_device_communicator_cls()
-            )
-            assert device_comm_cls == CudaCommunicator
-            self.device_communicator = CudaCommunicator(
-                cpu_group=self.cpu_group,
-                device=self.device,
-                device_group=self.device_group,
-                unique_name=self.unique_name,
-                global_ranks=self.ranks,
-                global_world_size=global_world_size,
-                tcp_store_group=self.tcp_store_group,
-            )
+            with profiler.track("stateless_group_init", f"{group_name}.device_communicator"):
+                device_comm_cls = resolve_obj_by_qualname(
+                    current_platform.get_device_communicator_cls()
+                )
+                assert device_comm_cls == CudaCommunicator
+                self.device_communicator = CudaCommunicator(
+                    cpu_group=self.cpu_group,
+                    device=self.device,
+                    device_group=self.device_group,
+                    unique_name=self.unique_name,
+                    global_ranks=self.ranks,
+                    global_world_size=global_world_size,
+                    tcp_store_group=self.tcp_store_group,
+                )
 
         self.mq_broadcaster = None
 

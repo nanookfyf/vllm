@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm.distributed.elastic_ep.profile import get_eep_profile
 from vllm.distributed.parallel_state import (
     _init_stateless_group,
     _node_count,
@@ -55,48 +56,62 @@ def create_standby_groups(
     world_group = get_world_group()
     assert isinstance(world_group, StatelessGroupCoordinator)
     backend = backend or world_group.backend
+    profiler = get_eep_profile(rank=world_group.rank)
 
-    coord_store = get_cached_tcp_store_client(master_ip, coord_store_port)
+    with profiler.track("create_standby_groups", "total"):
+        with profiler.track("create_standby_groups", "get_coord_store"):
+            coord_store = get_cached_tcp_store_client(master_ip, coord_store_port)
 
-    standby_world_ranks = [list(range(new_world_size_across_dp))]
-    _STANDBY_WORLD = _init_stateless_group(
-        standby_world_ranks,
-        "world",
-        master_ip,
-        backend,
-        use_device_communicator=False,
-        coord_store=coord_store,
-    )
-    _STANDBY_WORLD_NODE_COUNT = _node_count(_STANDBY_WORLD.tcp_store_group)
+        standby_world_ranks = [list(range(new_world_size_across_dp))]
+        with profiler.track("create_standby_groups", "init_world"):
+            _STANDBY_WORLD = _init_stateless_group(
+                standby_world_ranks,
+                "world",
+                master_ip,
+                backend,
+                use_device_communicator=False,
+                coord_store=coord_store,
+            )
+        with profiler.track("create_standby_groups", "detect_world_node_count"):
+            _STANDBY_WORLD_NODE_COUNT = _node_count(_STANDBY_WORLD.tcp_store_group)
 
-    tp_size = get_tp_group().world_size
-    pp_size = get_pp_group().world_size
+        tp_size = get_tp_group().world_size
+        pp_size = get_pp_group().world_size
 
-    all_ranks = torch.arange(new_world_size_across_dp).reshape(
-        -1, new_dp_size, pp_size, tp_size
-    )
-    standby_dp_ranks = all_ranks.transpose(1, 3).reshape(-1, new_dp_size).unbind(0)
-    standby_dp_ranks = [x.tolist() for x in standby_dp_ranks]
-    _STANDBY_DP = _init_stateless_group(
-        standby_dp_ranks, "dp", master_ip, backend, coord_store=coord_store
-    )
+        with profiler.track("create_standby_groups", "compute_rank_layout"):
+            all_ranks = torch.arange(new_world_size_across_dp).reshape(
+                -1, new_dp_size, pp_size, tp_size
+            )
+            standby_dp_ranks = all_ranks.transpose(1, 3).reshape(
+                -1, new_dp_size
+            ).unbind(0)
+            standby_dp_ranks = [x.tolist() for x in standby_dp_ranks]
+            standby_ep_ranks = (
+                all_ranks.transpose(1, 2)
+                .reshape(-1, new_dp_size * tp_size)
+                .unbind(0)
+            )
+            standby_ep_ranks = [x.tolist() for x in standby_ep_ranks]
 
-    standby_ep_ranks = (
-        all_ranks.transpose(1, 2).reshape(-1, new_dp_size * tp_size).unbind(0)
-    )
-    standby_ep_ranks = [x.tolist() for x in standby_ep_ranks]
-    _STANDBY_EP = _init_stateless_group(
-        standby_ep_ranks, "ep", master_ip, backend, coord_store=coord_store
-    )
+        with profiler.track("create_standby_groups", "init_dp"):
+            _STANDBY_DP = _init_stateless_group(
+                standby_dp_ranks, "dp", master_ip, backend, coord_store=coord_store
+            )
 
-    if enable_eplb:
-        _STANDBY_EPLB = _init_stateless_group(
-            standby_ep_ranks,
-            "eplb",
-            master_ip,
-            backend,
-            coord_store=coord_store,
-        )
+        with profiler.track("create_standby_groups", "init_ep"):
+            _STANDBY_EP = _init_stateless_group(
+                standby_ep_ranks, "ep", master_ip, backend, coord_store=coord_store
+            )
+
+        if enable_eplb:
+            with profiler.track("create_standby_groups", "init_eplb"):
+                _STANDBY_EPLB = _init_stateless_group(
+                    standby_ep_ranks,
+                    "eplb",
+                    master_ip,
+                    backend,
+                    coord_store=coord_store,
+                )
 
 
 def pop_standby_groups() -> dict:
