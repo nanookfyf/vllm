@@ -38,6 +38,11 @@ if has_flashinfer_nvlink_one_sided():
 logger = init_logger(__name__)
 
 
+def _ep_a2a(msg: str) -> None:
+    if envs.VLLM_EP_SYNC_DEBUG:
+        logger.info("[ep-a2a] %s", msg)
+
+
 class NaiveAll2AllManager(All2AllManagerBase):
     """
     A naive implementation of all2all communication.
@@ -66,10 +71,14 @@ class NaiveAll2AllManager(All2AllManagerBase):
         start = 0 if rank == 0 else cu_tokens_across_sp_cpu[rank - 1]
         end = cu_tokens_across_sp_cpu[rank]
         buffer[start:end, :].copy_(x)
+        _ep_a2a(
+            f"NaiveMulticast in r={rank}/{world_size} x={tuple(x.shape)} device={x.device}"
+        )
         for idx in range(world_size):
             start = 0 if idx == 0 else cu_tokens_across_sp_cpu[idx - 1]
             end = cu_tokens_across_sp_cpu[idx]
             get_ep_group().broadcast(buffer[start:end, :], idx)
+        _ep_a2a("NaiveMulticast out")
 
         return buffer
 
@@ -139,7 +148,11 @@ class NaiveAll2AllManager(All2AllManagerBase):
         start = 0 if ep_rank == 0 else cu_tokens_across_sp_cpu[ep_rank - 1]
         end = cu_tokens_across_sp_cpu[ep_rank]
 
+        _ep_a2a(
+            f"NaiveCombine all_reduce in ep_r={ep_rank} h={tuple(hidden_states.shape)}"
+        )
         all_hidden_states = get_ep_group().all_reduce(hidden_states)
+        _ep_a2a("NaiveCombine all_reduce out")
         hidden_states = all_hidden_states[start:end, :]
         return hidden_states
 
@@ -180,11 +193,17 @@ class AgRsAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
+        _ep_a2a(
+            f"AgRs dispatch_router_logits all_gatherv "
+            f"group={'ep' if is_sequence_parallel else 'dp'} "
+            f"r={dist_group.rank_in_group} h={tuple(hidden_states.shape)}"
+        )
         gathered_tensors = dist_group.all_gatherv(
             tensors_to_gather,
             dim=0,
             sizes=sizes,
         )
+        _ep_a2a("AgRs dispatch_router_logits all_gatherv out")
 
         if extra_tensors is not None:
             return (gathered_tensors[0], gathered_tensors[1], gathered_tensors[2:])
@@ -215,11 +234,16 @@ class AgRsAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
+        _ep_a2a(
+            f"AgRs dispatch all_gatherv group={'ep' if is_sequence_parallel else 'dp'} "
+            f"r={dist_group.rank_in_group} h={tuple(hidden_states.shape)}"
+        )
         gathered_tensors = dist_group.all_gatherv(
             tensors_to_gather,
             dim=0,
             sizes=sizes,
         )
+        _ep_a2a("AgRs dispatch all_gatherv out")
 
         hidden_states = gathered_tensors[0]
         topk_weights = gathered_tensors[1]
@@ -242,7 +266,12 @@ class AgRsAll2AllManager(All2AllManagerBase):
         assert sizes is not None
 
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
+        _ep_a2a(
+            f"AgRs combine reduce_scatterv group={'ep' if is_sequence_parallel else 'dp'} "
+            f"r={dist_group.rank_in_group} h={tuple(hidden_states.shape)}"
+        )
         hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
+        _ep_a2a("AgRs combine reduce_scatterv out")
         return hidden_states
 
     def destroy(self):

@@ -113,7 +113,31 @@ class CoreEngineProcManager:
         if client_handshake_address:
             common_kwargs["client_handshake_address"] = client_handshake_address
 
-        is_dp = vllm_config.parallel_config.data_parallel_size > 1
+        parallel_config = vllm_config.parallel_config
+        # Elastic EP shares a coordination TCPStore across all DP engine processes
+        # (StatelessGroupCoordinator / _init_elastic_ep_world). Ray's
+        # CoreEngineActorManager creates this in __init__; multiproc must match
+        # or _coord_store_port stays 0 and workers block on coord_store.get().
+        self._elastic_ep_coord_store = None
+        if parallel_config.enable_elastic_ep and parallel_config._coord_store_port == 0:
+            from vllm.distributed.utils import create_tcp_store
+
+            master_ip = parallel_config.data_parallel_master_ip
+            self._elastic_ep_coord_store = create_tcp_store(
+                master_ip,
+                0,
+                is_master=True,
+                world_size=-1,
+                wait_for_workers=False,
+            )
+            parallel_config._coord_store_port = self._elastic_ep_coord_store.port
+            logger.info(
+                "Elastic EP (multiproc): coordination TCPStore on %s:%s",
+                master_ip,
+                parallel_config._coord_store_port,
+            )
+
+        is_dp = parallel_config.data_parallel_size > 1
 
         from vllm.v1.engine.core import EngineCoreProc
 

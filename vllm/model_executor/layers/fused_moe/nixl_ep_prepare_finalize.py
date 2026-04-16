@@ -24,6 +24,105 @@ from vllm.v1.worker.ubatching import (
 
 logger = init_logger(__name__)
 
+
+def _global_expert_id_to_ep_rank_linear(
+    gid: int, num_global_experts: int, ep_size: int
+) -> int | None:
+    """EP rank that owns expert index ``gid`` under linear placement.
+
+    Matches ``determine_expert_map(..., expert_placement_strategy='linear')`` in
+    ``layer.py`` (contiguous index ranges per rank).
+
+    Index space is the same as ``FusedMoEConfig.num_experts`` / ``global_num_experts``:
+    without EPLB this is the model expert id; with EPLB + redundant experts, router
+    outputs **physical** expert ids after ``eplb_map_to_physical_and_record``, and
+    weights use ``global_num_experts = logical + redundant`` (see ``layer.py``).
+    """
+    if not (0 <= gid < num_global_experts):
+        return None
+    if ep_size <= 1:
+        return 0
+    base = num_global_experts // ep_size
+    rem = num_global_experts % ep_size
+    for r in range(ep_size):
+        start = r * base + min(r, rem)
+        local_n = base + (1 if r < rem else 0)
+        if start <= gid < start + local_n:
+            return r
+    return None
+
+
+def _global_expert_id_to_ep_rank_round_robin(gid: int, ep_size: int) -> int:
+    """EP rank that owns global expert ``gid`` under round-robin placement.
+
+    Matches ``owner = torch.remainder(global_indices, ep_size)`` in
+    ``FusedMoE.ensure_round_robin_expert_routing_tables`` (``layer.py``).
+    """
+    return int(gid) % ep_size
+
+
+def _nixl_ep_expert_owner_ep_ranks(
+    expert_topk: torch.Tensor,
+    num_experts_index_space: int,
+    ep_size: int,
+    has_round_robin_routing_tables: bool,
+    enable_eplb: bool,
+) -> list[int]:
+    """EP ranks that own the experts referenced in ``expert_topk``.
+
+    - **No EPLB, round-robin routing tables**: ``topk_ids`` are **global** model expert
+      ids (same convention as ``ensure_round_robin_expert_routing_tables``); owner is
+      ``gid % ep_size``.
+    - **EPLB (incl. redundant experts)**: router maps logical → **physical** expert ids
+      before MoE; ``topk_ids`` are physical indices in
+      ``[0, num_experts_index_space)`` where that count is logical + redundant. Use only
+      linear ``determine_expert_map`` over that physical count — do **not** use
+      round-robin ``% ep_size`` on those ids.
+    - **No EPLB, linear placement**: ``topk_ids`` are global expert ids; linear mapping.
+    """
+    if ep_size <= 1 or num_experts_index_space <= 0:
+        return []
+    t = expert_topk.detach().long().flatten()
+    t = t[t >= 0]
+    if t.numel() == 0:
+        return []
+    ranks: set[int] = set()
+    use_rr_owner = has_round_robin_routing_tables and not enable_eplb
+    for eid in t.unique():
+        gid = int(eid.item())
+        if use_rr_owner:
+            if 0 <= gid < num_experts_index_space:
+                ranks.add(_global_expert_id_to_ep_rank_round_robin(gid, ep_size))
+        else:
+            r = _global_expert_id_to_ep_rank_linear(
+                gid, num_experts_index_space, ep_size
+            )
+            if r is not None:
+                ranks.add(r)
+    return sorted(ranks)
+
+
+def _nixl_ep_token_source_ranks_from_handle(
+    handle: tuple, ep_size: int
+) -> list[int] | None:
+    """Ranks to which combine returns expert outputs (token home ranks), from dispatch handle.
+
+    ``nixl_ep.Buffer.dispatch`` packs ``packed_recv_src_info`` as the first handle element;
+    unique values in-range are treated as EP ranks. Returns None if not a rank tensor.
+    """
+    if len(handle) < 1:
+        return None
+    src_info = handle[0]
+    if not isinstance(src_info, torch.Tensor):
+        return None
+    t = src_info.detach()
+    if t.numel() == 0 or t.numel() > 8_000_000:
+        return None
+    vals = t.long().flatten().unique().cpu().tolist()
+    ranks = sorted({int(v) for v in vals if 0 <= int(v) < ep_size})
+    return ranks if ranks else None
+
+
 # NIXL EP kernels quantize dispatch inputs in 128 element chunks.
 NIXL_EP_QUANT_BLOCK_SIZE = 128
 NIXL_EP_QUANT_BLOCK_SHAPE = [NIXL_EP_QUANT_BLOCK_SIZE, NIXL_EP_QUANT_BLOCK_SIZE]
@@ -80,12 +179,15 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         global_to_physical: torch.Tensor | None = None,
         physical_to_global: torch.Tensor | None = None,
         local_expert_global_ids: torch.Tensor | None = None,
+        enable_eplb: bool = False,
     ):
         super().__init__()
 
         self.buffer = buffer
         self.max_tokens_per_rank = max_tokens_per_rank
         self.use_fp8_dispatch = use_fp8_dispatch
+        # EPLB: router outputs physical expert ids (logical + redundant replicas).
+        self.enable_eplb = enable_eplb
         # The dispatch function returns a handle that the combine function
         # requires. We store the handle here so it is available to the
         # combine function.
@@ -258,6 +360,19 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         # Dispatch
         dispatch_topk_ids = self._map_global_to_physical_ids(topk_ids)
+        if envs.VLLM_NIXL_EP_DEBUG:
+            send_to = _nixl_ep_expert_owner_ep_ranks(
+                topk_ids,
+                num_experts,
+                self.num_dispatchers_,
+                self.global_to_physical is not None,
+                self.enable_eplb,
+            )
+            logger.info(
+                "[nixl-ep] dispatch rank=%s send_to_ep_ranks=%s",
+                self.buffer.rank,
+                send_to,
+            )
         expert_x, expert_num_tokens, handle, _, hook = self.buffer.dispatch(
             a1,
             dispatch_topk_ids,
@@ -352,6 +467,21 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             combine_topk_weights = torch.ones_like(topk_weights)
 
         combine_topk_ids = self._map_global_to_physical_ids(topk_ids)
+        if envs.VLLM_NIXL_EP_DEBUG:
+            send_to = _nixl_ep_token_source_ranks_from_handle(
+                handle, self.num_dispatchers_
+            )
+            if send_to is None:
+                logger.info(
+                    "[nixl-ep] combine rank=%s send_to_ep_ranks=? (unparsed handle)",
+                    self.buffer.rank,
+                )
+            else:
+                logger.info(
+                    "[nixl-ep] combine rank=%s send_to_ep_ranks=%s",
+                    self.buffer.rank,
+                    send_to,
+                )
         # TODO (varun) : Enable zero copy mode
         dbo_maybe_run_recv_hook()
         _, _, recv_hook = self.buffer.combine(

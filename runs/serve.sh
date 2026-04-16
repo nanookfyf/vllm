@@ -25,12 +25,13 @@ vllm serve "$MODEL" --trust-remote-code --enable-sleep-mode \
     --host 0.0.0.0 \
     --port 8005 \
     --tensor-parallel-size 1 \
-    --gpu-memory-utilization 0.5 \
+    --gpu-memory-utilization 0.6 \
     --max-model-len 4096 \
     --no-enable-prefix-caching \
     --enable-expert-parallel \
     --enable-eplb \
     --enable-elastic-ep \
+    --all2all-backend nixl_ep \
     --eplb-config.num_redundant_experts 64 \
     --data-parallel-backend ray \
     --distributed-executor-backend ray \

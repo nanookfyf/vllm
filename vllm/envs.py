@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     VLLM_ENGINE_READY_TIMEOUT_S: int = 600
     VLLM_API_KEY: str | None = None
     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
+    VLLM_EP_SYNC_DEBUG: bool = False
     S3_ACCESS_KEY_ID: str | None = None
     S3_SECRET_ACCESS_KEY: str | None = None
     S3_ENDPOINT_URL: str | None = None
@@ -256,7 +257,12 @@ if TYPE_CHECKING:
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
     VLLM_EEP_PROFILE_CSV: str = ""
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = False
+    # MoE EP all2all / GroupCoordinator dispatch|combine tracing (see all2all.py).
+    VLLM_EP_SYNC_DEBUG: bool = False
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
+    # Log EP rank and peer EP ranks for nixl_ep dispatch/combine (see
+    # nixl_ep_prepare_finalize.py). Set VLLM_NIXL_EP_DEBUG=1 to enable.
+    VLLM_NIXL_EP_DEBUG: bool = False
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
 
 
@@ -1706,6 +1712,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NIXL_EP_MAX_NUM_RANKS": lambda: int(
         os.getenv("VLLM_NIXL_EP_MAX_NUM_RANKS", "32")
     ),
+    "VLLM_NIXL_EP_DEBUG": lambda: bool(int(os.getenv("VLLM_NIXL_EP_DEBUG", "0"))),
     # Whether enable XPU graph on Intel GPU
     "VLLM_XPU_ENABLE_XPU_GRAPH": lambda: bool(
         int(os.getenv("VLLM_XPU_ENABLE_XPU_GRAPH", "0"))
@@ -1714,6 +1721,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
         int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))
     ),
+    # Expert-parallel / MoE all2all debug logs ([ep-a2a] in all2all.py).
+    "VLLM_EP_SYNC_DEBUG": lambda: bool(int(os.getenv("VLLM_EP_SYNC_DEBUG", "0"))),
 }
 
 
@@ -1828,6 +1837,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOGGING_COLOR",
         "VLLM_LOG_STATS_INTERVAL",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
+        "VLLM_EP_SYNC_DEBUG",
+        "VLLM_NIXL_EP_DEBUG",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",

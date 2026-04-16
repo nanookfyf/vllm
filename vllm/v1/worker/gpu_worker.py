@@ -231,16 +231,16 @@ class Worker(WorkerBase):
 
     def prepare_sleep_ep_ranks(self, sleeping_ep_ranks: list[int]) -> None:
         self.model_runner.prepare_sleep_ep_ranks(sleeping_ep_ranks)
-        if get_ep_group().rank in sleeping_ep_ranks:
-            self._skip_dummy_batch = True
-            self._sync_only_sleep_active = True
-            self.model_runner.sync_only_sleep_active = True
+        # if get_ep_group().rank in sleeping_ep_ranks:
+        #     self._skip_dummy_batch = True
+        #     self._sync_only_sleep_active = True
+        #     self.model_runner.sync_only_sleep_active = True
 
     def restore_sleep_ep_ranks(self) -> None:
         self.model_runner.restore_sleep_ep_ranks()
-        self._skip_dummy_batch = False
-        self._sync_only_sleep_active = False
-        self.model_runner.sync_only_sleep_active = False
+        # self._skip_dummy_batch = False
+        # self._sync_only_sleep_active = False
+        # self.model_runner.sync_only_sleep_active = False
 
     def sleep_ep_ranks_by_tags(
         self,

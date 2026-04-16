@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
+export PATH=/usr/local/cuda/bin:$PATH
 MODEL="/mnt/nvme/fyf/models/DeepSeek-V2-Lite"
 LOG_FILE="/mnt/nvme/fyf/proj2/log/start_log.txt"
 
@@ -21,6 +21,7 @@ vllm serve "$MODEL" --trust-remote-code --enable-sleep-mode \
     --no-enable-prefix-caching \
     --enable-expert-parallel \
     --enable-eplb \
+    --all2all-backend nixl_ep \
     --eplb-config.num_redundant_experts 64 \
     --data-parallel-size 2 \
     --enforce-eager \

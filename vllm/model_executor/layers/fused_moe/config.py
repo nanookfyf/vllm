@@ -981,7 +981,10 @@ class FusedMoEParallelConfig:
 
     @property
     def use_batched_activation_format(self):
-        return self.use_deepep_ll_kernels
+        # Must match prepare/finalize activation layout (BatchedExperts) so the
+        # unquantized/FP8 oracles pick an experts class that accepts
+        # max_num_tokens / num_dispatchers (e.g. BatchedTritonExperts for NIXL EP).
+        return self.use_deepep_ll_kernels or self.use_nixl_ep_kernels
 
     @property
     def use_ag_rs_all2all_kernels(self):

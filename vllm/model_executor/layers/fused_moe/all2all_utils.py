@@ -276,6 +276,7 @@ def maybe_make_prepare_finalize(
             global_to_physical=global_to_physical,
             physical_to_global=physical_to_global,
             local_expert_global_ids=local_expert_global_ids,
+            enable_eplb=moe.moe_parallel_config.enable_eplb,
         )
 
     return prepare_finalize
