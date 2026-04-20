@@ -1021,6 +1021,56 @@ class EplbState:
         finally:
             self.is_async = is_async_enabled
 
+    def resize_logical_sleep(self, sleeping_ranks: Sequence[int]) -> None:
+        """Transition directly between logical-sleep suffix states.
+
+        This keeps the original pre-sleep snapshot intact for a later full
+        restore, but updates the current logical sleep mapping in-place.
+        """
+        if self.logical_sleep_state is None:
+            raise RuntimeError("logical sleep is not active")
+        if not self.model_states:
+            raise RuntimeError("logical sleep requires EPLB-managed MoE models")
+
+        ep_group = get_ep_group().device_group
+        target_rank_mapping = self.build_logical_sleep_rank_mapping(
+            ep_group.size(), sleeping_ranks
+        )
+        if target_rank_mapping == self.logical_sleep_state.rank_mapping:
+            return
+
+        active_rank_count = sum(
+            new_rank != -1 for new_rank in target_rank_mapping.values()
+        )
+        model_state = next(iter(self.model_states.values()))
+        num_local_physical_experts = (
+            model_state.expert_load_pass.shape[1] // ep_group.size()
+        )
+        active_physical_experts = active_rank_count * num_local_physical_experts
+        num_logical_experts = model_state.logical_replica_count.shape[1]
+        if active_physical_experts < num_logical_experts:
+            raise ValueError(
+                "logical sleep would leave too few active physical expert slots: "
+                f"{active_physical_experts} active slots for "
+                f"{num_logical_experts} logical experts"
+            )
+
+        is_async_enabled = self.is_async
+        self.is_async = False
+        try:
+            self.rearrange(
+                rank_mapping=target_rank_mapping,
+                preserve_world_size=True,
+            )
+            self.num_valid_physical_experts = active_physical_experts
+            self.expert_rearrangement_step = 0
+            self.logical_sleep_state.rank_mapping = target_rank_mapping
+            for state in self.model_states.values():
+                state.expert_load_pass[:, active_physical_experts:].zero_()
+                state.expert_load_window[:, :, active_physical_experts:].zero_()
+        finally:
+            self.is_async = is_async_enabled
+
     def start_async_loop(
         self,
         rank_mapping: dict[int, int] | None = None,

@@ -7,14 +7,12 @@ LOG_FILE="/mnt/nvme/fyf/proj2/log/start_log.txt"
 RAY_HOST="127.0.0.1"
 RAY_PORT="9305"
 
-export VLLM_NIXL_EP_DEBUG=1
 export RAY_ADDRESS="${RAY_HOST}:${RAY_PORT}"
 export VLLM_SERVER_DEV_MODE=1
 export RAY_DEDUP_LOGS=0
 export VLLM_EEP_PROFILE_CSV=/mnt/nvme/fyf/proj2/log/424/eep_profile.csv
 export PYTHONUNBUFFERED=1
 
-export VLLM_USE_RAY_COMPILED_DAG=0
 mkdir -p "$(dirname "$LOG_FILE")"
 
 # 如果本机没有固定 Ray 实例，就起一个。
@@ -22,8 +20,10 @@ mkdir -p "$(dirname "$LOG_FILE")"
 if ! ray status --address="$RAY_ADDRESS" >/dev/null 2>&1; then
     ray start --head --port="$RAY_PORT" --disable-usage-stats
 fi
-
-vllm serve "$MODEL" --trust-remote-code --enable-sleep-mode \
+py-spy record \
+  -o /mnt/nvme/fyf/proj2/log/pyspy_vllm.svg \
+  --subprocesses \
+  -- vllm serve "$MODEL" --trust-remote-code --enable-sleep-mode \
     --host 0.0.0.0 \
     --port 8005 \
     --tensor-parallel-size 1 \
@@ -34,11 +34,11 @@ vllm serve "$MODEL" --trust-remote-code --enable-sleep-mode \
     --enable-eplb \
     --enable-elastic-ep \
     --all2all-backend nixl_ep \
-    --eplb-config.num_redundant_experts 192 \
+    --eplb-config.num_redundant_experts 64 \
     --data-parallel-backend ray \
     --distributed-executor-backend ray \
-    --data-parallel-size 4 \
-    --data-parallel-size-local 4 \
+    --data-parallel-size 2 \
+    --data-parallel-size-local 2 \
     --data-parallel-rpc-port 9876 \
     --data-parallel-start-rank 0 \
     --enforce-eager \

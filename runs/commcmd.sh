@@ -1,6 +1,6 @@
 
-# export CUDA_VISIBLE_DEVICES=0,4
-
+# export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+# py-spy record -o profile.svg -- /mnt/nvme/fyf/proj2/vllm/runs/serve.sh
 VLLM_SERVER_DEV_MODE=1 vllm serve /mnt/nvme/fyf/models/DeepSeek-V2-Lite   --trust-remote-code   --tensor-parallel-size 1   --data-parallel-size 2   --api-server-count 1   --enable-expert-parallel   --enable-eplb   --eplb-config.num_redundant_experts 64   --enable-sleep-mode   --enforce-eager --port 8005 --gpu-memory-utilization 0.5
 
 

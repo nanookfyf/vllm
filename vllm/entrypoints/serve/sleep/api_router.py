@@ -158,6 +158,117 @@ async def wake_up_ep_ranks_by_tags(raw_request: Request):
     )
 
 
+@router.post("/wscale")
+async def wscale(raw_request: Request):
+    payload = await raw_request.json()
+    target_ep_size = payload.get("ep_size")
+    if not isinstance(target_ep_size, int):
+        raise HTTPException(status_code=400, detail="ep_size must be an integer")
+    tags = optional_tags(payload, "tags") or ["expert_weights"]
+
+    client = engine_client(raw_request)
+    states = await client.collective_rpc("get_ep_sleep_state")
+    if not states:
+        raise HTTPException(status_code=500, detail="failed to query EP sleep state")
+
+    first_state = states[0]
+    if any(state != first_state for state in states[1:]):
+        raise HTTPException(
+            status_code=500,
+            detail=f"inconsistent EP sleep state across workers: {states}",
+        )
+
+    ep_world_size = int(first_state["ep_world_size"])
+    active_ep_size = int(first_state["active_ep_size"])
+    current_sleeping = [int(rank) for rank in first_state["sleeping_ep_ranks"]]
+
+    if target_ep_size <= 0 or target_ep_size > ep_world_size:
+        raise HTTPException(
+            status_code=400,
+            detail=f"ep_size must be in [1, {ep_world_size}], got {target_ep_size}",
+        )
+
+    if target_ep_size == active_ep_size:
+        return JSONResponse(
+            content={
+                "ok": True,
+                "ep_world_size": ep_world_size,
+                "active_ep_size": active_ep_size,
+                "sleeping_ep_ranks": current_sleeping,
+                "changed": False,
+                "action": "noop",
+                "tags": tags,
+            }
+        )
+
+    target_sleeping = list(range(target_ep_size, ep_world_size))
+
+    if target_ep_size < active_ep_size:
+        newly_sleeping = [rank for rank in target_sleeping if rank not in current_sleeping]
+        if current_sleeping:
+            await client.collective_rpc(
+                "resize_sleep_ep_ranks",
+                kwargs={"sleeping_ep_ranks": target_sleeping},
+            )
+        else:
+            await client.collective_rpc(
+                "prepare_sleep_ep_ranks",
+                kwargs={"sleeping_ep_ranks": target_sleeping},
+            )
+        if newly_sleeping:
+            await client.collective_rpc(
+                "sleep_ep_ranks_by_tags",
+                kwargs={
+                    "sleeping_ep_ranks": newly_sleeping,
+                    "tags": tags,
+                },
+            )
+        action = "scale_down"
+    else:
+        if target_ep_size == ep_world_size:
+            if current_sleeping:
+                await client.collective_rpc(
+                    "wake_up_ep_ranks",
+                    kwargs={
+                        "sleeping_ep_ranks": current_sleeping,
+                        "tags": tags,
+                    },
+                )
+            await client.collective_rpc("restore_sleep_ep_ranks")
+        else:
+            waking_ranks = [rank for rank in current_sleeping if rank not in target_sleeping]
+            if waking_ranks:
+                await client.collective_rpc(
+                    "wake_up_ep_ranks",
+                    kwargs={
+                        "sleeping_ep_ranks": waking_ranks,
+                        "tags": tags,
+                    },
+                )
+            await client.collective_rpc(
+                "resize_sleep_ep_ranks",
+                kwargs={"sleeping_ep_ranks": target_sleeping},
+            )
+            if waking_ranks:
+                await client.collective_rpc(
+                    "resume_ep_ranks",
+                    kwargs={"ep_ranks": waking_ranks},
+                )
+        action = "scale_up"
+
+    return JSONResponse(
+        content={
+            "ok": True,
+            "ep_world_size": ep_world_size,
+            "active_ep_size": target_ep_size,
+            "sleeping_ep_ranks": target_sleeping,
+            "changed": True,
+            "action": action,
+            "tags": tags,
+        }
+    )
+
+
 def attach_router(app: FastAPI):
     if not envs.VLLM_SERVER_DEV_MODE:
         return

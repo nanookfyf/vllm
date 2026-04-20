@@ -238,9 +238,15 @@ class Worker(WorkerBase):
 
     def restore_sleep_ep_ranks(self) -> None:
         self.model_runner.restore_sleep_ep_ranks()
-        # self._skip_dummy_batch = False
-        # self._sync_only_sleep_active = False
-        # self.model_runner.sync_only_sleep_active = False
+        self._skip_dummy_batch = False
+        self._sync_only_sleep_active = False
+        self.model_runner.sync_only_sleep_active = False
+
+    def resize_sleep_ep_ranks(self, sleeping_ep_ranks: list[int]) -> None:
+        self.model_runner.resize_sleep_ep_ranks(sleeping_ep_ranks)
+
+    def get_ep_sleep_state(self) -> dict[str, object]:
+        return self.model_runner.get_ep_sleep_state()
 
     def sleep_ep_ranks_by_tags(
         self,
@@ -271,6 +277,9 @@ class Worker(WorkerBase):
     ) -> None:
         if get_ep_group().rank in sleeping_ep_ranks:
             self.wake_up(tags=tags)
+
+    def resume_ep_ranks(self, ep_ranks: list[int]) -> None:
+        if get_ep_group().rank in ep_ranks:
             self._skip_dummy_batch = False
             self._sync_only_sleep_active = False
             self.model_runner.sync_only_sleep_active = False
