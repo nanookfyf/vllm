@@ -257,6 +257,7 @@ if TYPE_CHECKING:
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
+    VLLM_EP_SCALE_DEBUG: bool = False # This is a temporary flag for debugging EP scale up issues, will be removed after the issues are resolved.
 
 
 def get_default_cache_root():
