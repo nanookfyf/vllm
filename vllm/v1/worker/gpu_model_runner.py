@@ -1771,6 +1771,31 @@ class GPUModelRunner(
 
         return encoder_seq_lens, encoder_seq_lens_cpu
 
+    def retag_sleep_mode_weights(self) -> None:
+        """Split sleep-mode weight allocations into shared/expert buckets."""
+        if not self.vllm_config.model_config.enable_sleep_mode:
+            return
+
+        model = self.get_model()
+        if not is_mixture_of_experts(model):
+            return
+
+        from vllm.device_allocator.cumem import CuMemAllocator
+
+        allocator = CuMemAllocator.get_instance()
+        allocator.rename_tag("weights", "shared_weights")
+
+        expert_ptrs: set[int] = set()
+        for weight_group in model.expert_weights:
+            for weight in weight_group:
+                expert_ptrs.add(weight.data_ptr())
+                try:
+                    expert_ptrs.add(weight.untyped_storage().data_ptr())
+                except RuntimeError:
+                    pass
+
+        allocator.retag_allocations_by_ptrs(expert_ptrs, "expert_weights")
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -4799,7 +4824,9 @@ class GPUModelRunner(
                             spec_config.draft_model_config,
                         )
                         eplb_models += 1
-
+                        self.retag_sleep_mode_weights()
+                        logger.info("retag_sleep_mode_weights done")
+                        
                 if self.use_aux_hidden_state_outputs:
                     if not supports_eagle3(self.get_model()):
                         raise RuntimeError(
