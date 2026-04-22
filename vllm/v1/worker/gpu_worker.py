@@ -195,6 +195,9 @@ class Worker(WorkerBase):
         if tags is None or "kv_cache" in tags:
             self.model_runner.post_kv_cache_wake_up()
 
+    def resize_sleep_ep_ranks(self, sleeping_ep_ranks: list[int]) -> None:
+        self.model_runner.resize_sleep_ep_ranks(sleeping_ep_ranks)
+
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         if not self.vllm_config.model_config.enable_cumem_allocator:
             return nullcontext()
