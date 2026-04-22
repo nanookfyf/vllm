@@ -5251,6 +5251,15 @@ class GPUModelRunner(
                 pin_memory=self.pin_memory,
             )
         )
+    
+    def resize_sleep_ep_ranks(self, sleeping_ep_ranks: list[int]) -> None:
+        assert self.parallel_config.enable_eplb, (
+            "Logical EP sleep requires EPLB to manage expert mappings."
+        )
+        assert self.eplb_state is not None
+        model = self.get_model()
+        assert is_mixture_of_experts(model), "Logical EP sleep requires an MoE model."
+        self.eplb_state.resize_logical_sleep(sleeping_ep_ranks)
 
     @torch.inference_mode()
     def _dummy_run(
