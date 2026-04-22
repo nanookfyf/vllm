@@ -201,6 +201,9 @@ class Worker(WorkerBase):
     def resize_sleep_ep_ranks(self, sleeping_ep_ranks: list[int]) -> None:
         self.model_runner.resize_sleep_ep_ranks(sleeping_ep_ranks)
 
+    def get_ep_sleep_state(self) -> dict[str, object]:
+        return self.model_runner.get_ep_sleep_state()
+
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         if not self.vllm_config.model_config.enable_cumem_allocator:
             return nullcontext()
