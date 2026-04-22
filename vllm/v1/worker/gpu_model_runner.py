@@ -4865,6 +4865,8 @@ class GPUModelRunner(
                         self.model_config,
                     )
                     eplb_models += 1
+                    self.retag_sleep_mode_weights()
+                    logger.info("retag_sleep_mode_weights done")
 
                 time_after_load = time.perf_counter()
             self.model_memory_usage = m.consumed_memory
@@ -5283,8 +5285,15 @@ class GPUModelRunner(
         assert self.eplb_state is not None
         model = self.get_model()
         assert is_mixture_of_experts(model), "Logical EP sleep requires an MoE model."
-        self.eplb_state.resize_logical_sleep(sleeping_ep_ranks)
+        if sleeping_ep_ranks:
+            if self.eplb_state.is_logical_sleep_active():
+                self.eplb_state.resize_logical_sleep(sleeping_ep_ranks)
+            else:
+                self.eplb_state.prepare_logical_sleep(sleeping_ep_ranks)
+        else:
+            self.eplb_state.restore_logical_sleep()
         self._update_nixl_ep_sleep_mask(sleeping_ep_ranks)
+        torch.accelerator.synchronize()
 
     @torch.inference_mode()
     def _dummy_run(

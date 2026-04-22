@@ -41,6 +41,21 @@ def engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
 
 
+async def _get_consistent_ep_sleep_state(client: EngineClient) -> dict[str, object]:
+    states = await client.collective_rpc("get_ep_sleep_state")
+    if not states:
+        raise HTTPException(status_code=500, detail="failed to query EP sleep state")
+
+    first_state = states[0]
+    if any(state != first_state for state in states[1:]):
+        raise HTTPException(
+            status_code=500,
+            detail=f"inconsistent EP sleep state across workers: {states}",
+        )
+
+    return first_state
+
+
 router = APIRouter()
 
 
@@ -127,17 +142,7 @@ async def wscale(raw_request: Request):
     tags = optional_tags(payload, "tags") or ["expert_weights"]
 
     client = engine_client(raw_request)
-    states = await client.collective_rpc("get_ep_sleep_state")
-    if not states:
-        raise HTTPException(status_code=500, detail="failed to query EP sleep state")
-
-    first_state = states[0]
-    if any(state != first_state for state in states[1:]):
-        raise HTTPException(
-            status_code=500,
-            detail=f"inconsistent EP sleep state across workers: {states}",
-        )
-
+    first_state = await _get_consistent_ep_sleep_state(client)
     ep_world_size = int(first_state["ep_world_size"])
     active_ep_size = int(first_state["active_ep_size"])
     current_sleeping = [int(rank) for rank in first_state["sleeping_ep_ranks"]]
@@ -165,36 +170,35 @@ async def wscale(raw_request: Request):
 
     if target_ep_size < active_ep_size:
         newly_sleeping = [rank for rank in target_sleeping if rank not in current_sleeping]
-        if current_sleeping:
+        try:
             await client.collective_rpc(
                 "resize_sleep_ep_ranks",
                 kwargs={"sleeping_ep_ranks": target_sleeping},
             )
-        if newly_sleeping:
-            await client.collective_rpc(
-                "sleep_ep_ranks_by_tags",
-                kwargs={
-                    "sleeping_ep_ranks": newly_sleeping,
-                    "tags": tags,
-                },
-            )
-        action = "scale_down"
-    else:
-        if target_ep_size == ep_world_size:
-            if current_sleeping:
+            if newly_sleeping:
                 await client.collective_rpc(
-                    "wake_up_ep_ranks",
+                    "sleep_ep_ranks_by_tags",
                     kwargs={
-                        "sleeping_ep_ranks": current_sleeping,
+                        "sleeping_ep_ranks": newly_sleeping,
                         "tags": tags,
                     },
                 )
-            await client.collective_rpc(
-                "resize_sleep_ep_ranks",
-                kwargs={"sleeping_ep_ranks": target_sleeping},
-            )
-        else:
-            waking_ranks = [rank for rank in current_sleeping if rank not in target_sleeping]
+        except Exception as e:
+            try:
+                await client.collective_rpc(
+                    "resize_sleep_ep_ranks",
+                    kwargs={"sleeping_ep_ranks": current_sleeping},
+                )
+            except Exception:
+                logger.exception("flash_epscale scale_down rollback failed")
+            raise HTTPException(
+                status_code=500,
+                detail=f"flash_epscale scale_down failed: {e}",
+            ) from e
+        action = "scale_down"
+    else:
+        waking_ranks = [rank for rank in current_sleeping if rank not in target_sleeping]
+        try:
             if waking_ranks:
                 await client.collective_rpc(
                     "wake_up_ep_ranks",
@@ -207,15 +211,53 @@ async def wscale(raw_request: Request):
                 "resize_sleep_ep_ranks",
                 kwargs={"sleeping_ep_ranks": target_sleeping},
             )
-            
+        except Exception as e:
+            if waking_ranks:
+                try:
+                    await client.collective_rpc(
+                        "sleep_ep_ranks_by_tags",
+                        kwargs={
+                            "sleeping_ep_ranks": waking_ranks,
+                            "tags": tags,
+                        },
+                    )
+                except Exception:
+                    logger.exception("flash_epscale scale_up rollback sleep failed")
+            try:
+                await client.collective_rpc(
+                    "resize_sleep_ep_ranks",
+                    kwargs={"sleeping_ep_ranks": current_sleeping},
+                )
+            except Exception:
+                logger.exception("flash_epscale scale_up rollback resize failed")
+            raise HTTPException(
+                status_code=500,
+                detail=f"flash_epscale scale_up failed: {e}",
+            ) from e
+
         action = "scale_up"
+
+    final_state = await _get_consistent_ep_sleep_state(client)
+    final_active_ep_size = int(final_state["active_ep_size"])
+    final_sleeping = [int(rank) for rank in final_state["sleeping_ep_ranks"]]
+    if final_active_ep_size != target_ep_size or final_sleeping != target_sleeping:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "flash_epscale finished with unexpected EP sleep state: "
+                f"expected active_ep_size={target_ep_size}, "
+                f"sleeping_ep_ranks={target_sleeping}, got "
+                f"active_ep_size={final_active_ep_size}, "
+                f"sleeping_ep_ranks={final_sleeping}"
+            ),
+        )
 
     return JSONResponse(
         content={
             "ok": True,
             "ep_world_size": ep_world_size,
-            "active_ep_size": target_ep_size,
-            "sleeping_ep_ranks": target_sleeping,
+            "active_ep_size": final_active_ep_size,
+            "sleeping_ep_ranks": final_sleeping,
             "changed": True,
             "action": action,
             "tags": tags,
