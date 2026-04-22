@@ -166,6 +166,8 @@ class Worker(WorkerBase):
                 name: buffer.cpu().clone() for name, buffer in model.named_buffers()
             }
 
+        self.model_runner.skip_dummy_model_forward = True
+
         allocator = CuMemAllocator.get_instance()
         allocator.sleep(offload_tags=tags if level == 1 else tuple())
         free_bytes_after_sleep, total = torch.cuda.mem_get_info()
@@ -191,7 +193,8 @@ class Worker(WorkerBase):
                 if name in self._sleep_saved_buffers:
                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
             self._sleep_saved_buffers = {}
-
+            
+        self.model_runner.skip_dummy_model_forward = False
         # If the KV cache has just been woken up,
         # the internal state of cache_engine must be reset,
         # especially the FP8 scaling factor.
