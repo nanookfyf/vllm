@@ -5157,7 +5157,30 @@ class GPUModelRunner(
             self._sync_device()
 
         return prompt_logprobs_dict
+    
+    def _update_nixl_ep_sleep_mask(self, sleeping_ep_ranks: Sequence[int]) -> None:
+        from vllm.distributed.parallel_state import get_ep_group
+        all2all_manager = get_ep_group().device_communicator.all2all_manager
+        if all2all_manager is None or not hasattr(all2all_manager, "set_masked_ranks"):
+            return
+        all2all_manager.set_masked_ranks(list(sleeping_ep_ranks))
 
+    def get_ep_sleep_state(self) -> dict[str, object]:
+        from vllm.distributed.parallel_state import get_ep_group
+        ep_world_size = get_ep_group().world_size
+        sleeping_ep_ranks: list[int] = []
+        if self.eplb_state is not None and self.eplb_state.logical_sleep_state is not None:
+            sleeping_ep_ranks = sorted(
+                rank
+                for rank, new_rank in self.eplb_state.logical_sleep_state.rank_mapping.items()
+                if new_rank == -1
+            )
+        active_ep_size = ep_world_size - len(sleeping_ep_ranks)
+        return {
+            "ep_world_size": ep_world_size,
+            "active_ep_size": active_ep_size,
+            "sleeping_ep_ranks": sleeping_ep_ranks,
+        }
     def _get_nans_in_logits(
         self,
         logits: torch.Tensor | None,
@@ -5261,6 +5284,7 @@ class GPUModelRunner(
         model = self.get_model()
         assert is_mixture_of_experts(model), "Logical EP sleep requires an MoE model."
         self.eplb_state.resize_logical_sleep(sleeping_ep_ranks)
+        self._update_nixl_ep_sleep_mask(sleeping_ep_ranks)
 
     @torch.inference_mode()
     def _dummy_run(
@@ -5655,7 +5679,7 @@ class GPUModelRunner(
             return torch.tensor([]), torch.tensor([])
 
         assert hidden_states is not None
-        
+
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
         logit_indices_device = torch.from_numpy(logit_indices).to(
             self.device, non_blocking=True

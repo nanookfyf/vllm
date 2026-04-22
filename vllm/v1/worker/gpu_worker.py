@@ -193,7 +193,7 @@ class Worker(WorkerBase):
                 if name in self._sleep_saved_buffers:
                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
             self._sleep_saved_buffers = {}
-            
+
         self.model_runner.skip_dummy_model_forward = False
         # If the KV cache has just been woken up,
         # the internal state of cache_engine must be reset,
@@ -207,6 +207,9 @@ class Worker(WorkerBase):
 
     def resize_sleep_ep_ranks(self, sleeping_ep_ranks: list[int]) -> None:
         self.model_runner.resize_sleep_ep_ranks(sleeping_ep_ranks)
+
+    def get_ep_sleep_state(self) -> dict[str, object]:
+        return self.model_runner.get_ep_sleep_state()
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         if not self.vllm_config.model_config.enable_sleep_mode:
