@@ -532,6 +532,7 @@ class GPUModelRunner(
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
 
         self.use_aux_hidden_state_outputs = False
+        self.skip_dummy_model_forward: bool = False
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
@@ -5677,6 +5678,8 @@ class GPUModelRunner(
 
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
 
+        _sleep_skip_forward = self.skip_dummy_model_forward
+        
         _cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = (
             self._determine_batch_execution_and_padding(
                 num_tokens=num_tokens_unpadded,
@@ -5859,20 +5862,38 @@ class GPUModelRunner(
                     slot_mapping=slot_mappings,
                 ),
             ):
-                outputs = self.model(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
-                )
+                
+                # outputs = self.model(
+                #     input_ids=input_ids,
+                #     positions=positions,
+                #     intermediate_tensors=intermediate_tensors,
+                #     inputs_embeds=inputs_embeds,
+                #     **model_kwargs,
+                # )
+                if not _sleep_skip_forward:
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs,
+                    )
+                else:
+                    outputs = None
 
-            if self.use_aux_hidden_state_outputs:
-                hidden_states, _ = outputs
+            # if self.use_aux_hidden_state_outputs:
+            #     hidden_states, _ = outputs
+            # else:
+            #     hidden_states = outputs
+            if outputs is not None:
+                if self.use_aux_hidden_state_outputs:
+                    hidden_states, _ = outputs
+                else:
+                    hidden_states = outputs
             else:
-                hidden_states = outputs
+                hidden_states = None
 
-            if self.speculative_config and (
+            if not _sleep_skip_forward and self.speculative_config and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
@@ -5938,6 +5959,15 @@ class GPUModelRunner(
         if not skip_eplb:
             self.eplb_step(is_dummy=True, is_profile=is_profile)
 
+        if _sleep_skip_forward:
+            logger.info(
+                "Dummy run skipped model/drafter (sync-only EP sleep or CuMem "
+                "weight offload); returning empty hidden states."
+            )
+            return torch.tensor([]), torch.tensor([])
+
+        assert hidden_states is not None
+        
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
         logit_indices_device = torch.from_numpy(logit_indices).to(
             self.device, non_blocking=True
