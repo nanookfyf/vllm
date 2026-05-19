@@ -705,6 +705,7 @@ class EplbState:
         This keeps the original pre-sleep snapshot intact for a later full
         restore, but updates the current logical sleep mapping in-place.
         """
+        torch.accelerator.synchronize()
         if self.logical_sleep_state is None:
             raise RuntimeError("logical sleep is not active")
         if not self.model_states:
@@ -726,6 +727,46 @@ class EplbState:
         )
         self.logical_sleep_state.rank_mapping = target_rank_mapping
 
+    def _validate_logical_sleep_capacity(
+        self,
+        ep_group: ProcessGroup,
+        rank_mapping: dict[int, int],
+    ) -> int:
+        active_rank_count = sum(new_rank != -1 for new_rank in rank_mapping.values())
+        model_state = next(iter(self.model_states.values()))
+        num_local_physical_experts = (
+            model_state.expert_load_pass.shape[1] // ep_group.size()
+        )
+        active_physical_experts = active_rank_count * num_local_physical_experts
+        num_logical_experts = model_state.logical_replica_count.shape[1]
+        if active_physical_experts < num_logical_experts:
+            raise ValueError(
+                "logical sleep would leave too few active physical expert slots: "
+                f"{active_physical_experts} active slots for "
+                f"{num_logical_experts} logical experts"
+            )
+        return active_physical_experts
+
+    def _apply_logical_sleep_mapping(
+        self,
+        rank_mapping: dict[int, int],
+        active_physical_experts: int,
+    ) -> None:
+        is_async_enabled = self.is_async
+        self.is_async = False
+        try:
+            self.rearrange(
+                rank_mapping=rank_mapping,
+                preserve_world_size=True,
+            )
+            self.num_valid_physical_experts = active_physical_experts
+            self.expert_rearrangement_step = 0
+            for state in self.model_states.values():
+                state.expert_load_pass[:, active_physical_experts:].zero_()
+                state.expert_load_window[:, :, active_physical_experts:].zero_()
+        finally:
+            self.is_async = is_async_enabled
+
     def prepare_logical_sleep(self, sleeping_ranks: Sequence[int]) -> None:
         """Move experts away from suffix EP ranks without rebuilding process groups."""
         if self.logical_sleep_state is not None:
@@ -737,17 +778,9 @@ class EplbState:
         rank_mapping = self.build_logical_sleep_rank_mapping(
             ep_group.size(), sleeping_ranks
         )
-        active_rank_count = sum(new_rank != -1 for new_rank in rank_mapping.values())
-        model_state = next(iter(self.model_states.values()))
-        num_local_physical_experts = model_state.expert_load_pass.shape[1] // ep_group.size()
-        active_physical_experts = active_rank_count * num_local_physical_experts
-        num_logical_experts = model_state.logical_replica_count.shape[1]
-        if active_physical_experts < num_logical_experts:
-            raise ValueError(
-                "logical sleep would leave too few active physical expert slots: "
-                f"{active_physical_experts} active slots for "
-                f"{num_logical_experts} logical experts"
-            )
+        active_physical_experts = self._validate_logical_sleep_capacity(
+            ep_group, rank_mapping
+        )
 
         self.logical_sleep_state = EplbLogicalSleepState(
             rank_mapping=rank_mapping,
@@ -766,24 +799,11 @@ class EplbState:
             },
         )
 
-        is_async_enabled = self.is_async
-        self.is_async = False
         try:
-            self.rearrange(
-                rank_mapping=rank_mapping,
-                preserve_world_size=True,
-            )
-            self.num_valid_physical_experts = active_physical_experts
-            self.expert_rearrangement_step = 0
-            for state in self.model_states.values():
-                state.expert_load_pass[:, active_physical_experts:].zero_()
-                state.expert_load_window[:, :, active_physical_experts:].zero_()
-
+            self._apply_logical_sleep_mapping(rank_mapping, active_physical_experts)
         except Exception:
             self.logical_sleep_state = None
             raise
-        finally:
-            self.is_async = is_async_enabled
 
     def restore_logical_sleep(self) -> None:
         """Restore the pre-sleep EPLB mappings after logically sleeping ranks wake."""
@@ -860,28 +880,46 @@ class EplbState:
         # Map the physical expert load to global logical experts
         global_expert_load_windows = []
         for eplb_model_state in self.model_states.values():
-            expert_load_window = eplb_model_state.expert_load_window[
-                :, :, : self.num_valid_physical_experts
-            ]
+            expert_load_window_cpu = (
+                eplb_model_state.expert_load_window[
+                    :, :, : self.num_valid_physical_experts
+                ]
+                .detach()
+                .cpu()
+            )
+            physical_to_logical_map = (
+                eplb_model_state.physical_to_logical_map[
+                    :, : self.num_valid_physical_experts
+                ]
+                .detach()
+                .cpu()
+            )
+            valid_expert_mask = (
+                (physical_to_logical_map >= 0)
+                & (physical_to_logical_map < eplb_model_state.model.num_logical_experts)
+            )
             logical_expert_load_window = torch.zeros(
                 self.expert_load_window_size,
                 eplb_model_state.model.num_moe_layers,
                 eplb_model_state.model.num_logical_experts,
-                dtype=eplb_model_state.expert_load_window.dtype,
-                device=eplb_model_state.expert_load_window.device,
+                dtype=expert_load_window_cpu.dtype,
+                device="cpu",
             )
             logical_expert_load_window.scatter_add_(
                 dim=-1,
-                index=eplb_model_state.physical_to_logical_map[
-                    :, : self.num_valid_physical_experts
-                ]
+                index=physical_to_logical_map.clamp(
+                    min=0,
+                    max=eplb_model_state.model.num_logical_experts - 1,
+                )
                 .unsqueeze(0)
-                .expand_as(expert_load_window)
+                .expand_as(expert_load_window_cpu)
                 .long(),
-                src=expert_load_window,
+                src=expert_load_window_cpu * valid_expert_mask.unsqueeze(0),
             )
 
-            global_expert_load_window = logical_expert_load_window.sum(dim=0)
+            global_expert_load_window = logical_expert_load_window.sum(dim=0).to(
+                eplb_model_state.expert_load_window.device
+            )
             global_expert_load_windows.append(global_expert_load_window)
         # Perform all-reduce to get the expert load across all ranks for each model
         global_expert_load_windows = self._allreduce_list(global_expert_load_windows)

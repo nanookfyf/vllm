@@ -43,6 +43,7 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
     get_dcp_group,
+    get_dp_group,
     get_pp_group,
     get_tp_group,
     graph_capture,
@@ -3280,6 +3281,8 @@ class GPUModelRunner(
             return
 
         assert self.eplb_state is not None
+        if self.eplb_state.is_logical_sleep_active():
+            return
         assert self._moe_model is not None
         self.eplb_state.step(
             is_dummy,
@@ -5492,6 +5495,17 @@ class GPUModelRunner(
             "active_ep_size": active_ep_size,
             "sleeping_ep_ranks": sleeping_ep_ranks,
         }
+
+    def _sync_dp_group_to_active_ep_size(
+        self, active_ep_size: int | None = None
+    ) -> int:
+        if active_ep_size is None:
+            active_ep_size = int(self.get_ep_sleep_state()["active_ep_size"])
+        if self.parallel_config.data_parallel_size <= 1:
+            return active_ep_size
+        get_dp_group(active_ep_size)
+        return active_ep_size
+
     def _get_nans_in_logits(
         self,
         logits: torch.Tensor | None,
@@ -5602,6 +5616,8 @@ class GPUModelRunner(
         else:
             self.eplb_state.restore_logical_sleep()
         self._update_nixl_ep_sleep_mask(sleeping_ep_ranks)
+        ep_world_size = int(self.get_ep_sleep_state()["ep_world_size"])
+        self._sync_dp_group_to_active_ep_size(ep_world_size - len(sleeping_ep_ranks))
         torch.accelerator.synchronize()
 
     @torch.inference_mode()
@@ -5710,7 +5726,20 @@ class GPUModelRunner(
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
 
         _sleep_skip_forward = self.skip_dummy_model_forward
-        
+        ep_sleep_state = self.get_ep_sleep_state()
+        active_ep_size = int(ep_sleep_state["active_ep_size"])
+        ep_world_size = int(ep_sleep_state["ep_world_size"])
+        self._sync_dp_group_to_active_ep_size(active_ep_size)
+        logical_sleep_active = active_ep_size < ep_world_size
+        if (
+            _sleep_skip_forward
+            and self.parallel_config.data_parallel_rank >= active_ep_size
+        ):
+            # logger.info(
+            #     "Dummy run skipped before DP synchronization for sleeping EP rank."
+            # )
+            return torch.tensor([]), torch.tensor([])
+
         _cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = (
             self._determine_batch_execution_and_padding(
                 num_tokens=num_tokens_unpadded,
@@ -5987,7 +6016,7 @@ class GPUModelRunner(
         # not have any requests to process, so they're executing dummy batches.
         # In such cases, we still have to trigger EPLB to make sure
         # ranks execute the rearrangement in synchronization.
-        if not skip_eplb:
+        if not skip_eplb and not logical_sleep_active:
             self.eplb_step(is_dummy=True, is_profile=is_profile)
 
         if _sleep_skip_forward:
