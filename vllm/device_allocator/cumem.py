@@ -174,6 +174,24 @@ class CuMemAllocator:
         )
         return data.handle
 
+    def rename_tag(self, old_tag: str, new_tag: str) -> int:
+        """Rename all tracked allocations that currently use ``old_tag``."""
+        changed = 0
+        for data in self.pointer_to_data.values():
+            if data.tag == old_tag:
+                data.tag = new_tag
+                changed += 1
+        return changed
+
+    def retag_allocations_by_ptrs(self, ptrs: set[int], tag: str) -> int:
+        """Assign ``tag`` to tracked allocations identified by device ptr."""
+        changed = 0
+        for ptr, data in self.pointer_to_data.items():
+            if ptr in ptrs:
+                data.tag = tag
+                changed += 1
+        return changed
+
     def sleep(self, offload_tags: tuple[str, ...] | str | None = None) -> None:
         """
         Put the allocator in sleep mode.
@@ -196,6 +214,8 @@ class CuMemAllocator:
         backup_bytes = 0
 
         for ptr, data in self.pointer_to_data.items():
+            if offload_tags is not None and data.tag not in offload_tags:
+                continue
             handle = data.handle
             total_bytes += handle[1]
             if data.tag in offload_tags:
