@@ -4,6 +4,7 @@
 
 import asyncio
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -15,23 +16,25 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+DEFAULT_TAGS = ["expert_weights", "kv_cache"]
 
-def elapsed_ms(start: float) -> float:
+
+def _elapsed_ms(start: float) -> float:
     return round((time.perf_counter() - start) * 1000, 3)
 
 
-def optional_timeout(payload: dict, key: str, default: float) -> float:
+def _optional_timeout(payload: dict, key: str, default: float) -> float:
     value = payload.get(key, default)
     if not isinstance(value, (int, float)) or value <= 0:
         raise HTTPException(status_code=400, detail=f"{key} must be a positive number")
     return float(value)
 
 
-def engine_client(request: Request) -> EngineClient:
+def _engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
 
 
-def flash_epscale_lock(request: Request) -> asyncio.Lock:
+def _flash_epscale_lock(request: Request) -> asyncio.Lock:
     lock = getattr(request.app.state, "flash_epscale_lock", None)
     if lock is None:
         lock = asyncio.Lock()
@@ -39,19 +42,43 @@ def flash_epscale_lock(request: Request) -> asyncio.Lock:
     return lock
 
 
-async def _get_consistent_ep_sleep_state(client: EngineClient) -> dict[str, object]:
+async def _query_ep_state(client: EngineClient) -> dict[str, object]:
     states = await client.collective_rpc("get_ep_sleep_state")
     if not states:
         raise HTTPException(status_code=500, detail="failed to query EP sleep state")
-
-    first_state = states[0]
-    if any(state != first_state for state in states[1:]):
+    first = states[0]
+    if any(s != first for s in states[1:]):
         raise HTTPException(
             status_code=500,
             detail=f"inconsistent EP sleep state across workers: {states}",
         )
+    return first
 
-    return first_state
+
+@asynccontextmanager
+async def _timed(timing: dict[str, float], key: str):
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        timing[key] = _elapsed_ms(start)
+
+
+@asynccontextmanager
+async def _paused(client: EngineClient, timing: dict[str, float]):
+    """Stop-the-world only around the steps that require global quiescence
+    (NCCL split, EPLB remap, sleep/wake RPCs).  Always resume on exit, even
+    on error, so the engine never gets stuck paused."""
+    async with _timed(timing, "pause"):
+        await client.pause_generation(mode="abort", clear_cache=False)
+    try:
+        yield
+    finally:
+        try:
+            async with _timed(timing, "resume"):
+                await client.resume_generation()
+        except Exception:
+            logger.exception("flash_epscale resume failed")
 
 
 router = APIRouter()
@@ -63,23 +90,19 @@ async def flash_epscale(raw_request: Request):
     target_ep_size = payload.get("ep_size")
     if not isinstance(target_ep_size, int):
         raise HTTPException(status_code=400, detail="ep_size must be an integer")
-    tags = optional_tags(payload, "tags") or ["expert_weights", "kv_cache"]
-    client = engine_client(raw_request)
-    drain_timeout = optional_timeout(payload, "drain_timeout", 300)
-    set_active_dp_size = getattr(client, "set_active_data_parallel_size", None)
-    wait_for_dp_drain = getattr(client, "wait_for_dp_ranks_to_drain", None)
-    pause_generation = getattr(client, "pause_generation", None)
-    resume_generation = getattr(client, "resume_generation", None)
-    timing_ms: dict[str, float] = {}
+    tags = optional_tags(payload, "tags") or DEFAULT_TAGS
+    drain_timeout = _optional_timeout(payload, "drain_timeout", 300)
+    client = _engine_client(raw_request)
+
+    timing: dict[str, float] = {}
     total_start = time.perf_counter()
 
-    async with flash_epscale_lock(raw_request):
-        step_start = time.perf_counter()
-        first_state = await _get_consistent_ep_sleep_state(client)
-        timing_ms["query_state"] = elapsed_ms(step_start)
-        ep_world_size = int(first_state["ep_world_size"])
-        active_ep_size = int(first_state["active_ep_size"])
-        current_sleeping = [int(rank) for rank in first_state["sleeping_ep_ranks"]]
+    async with _flash_epscale_lock(raw_request):
+        async with _timed(timing, "query_state"):
+            state = await _query_ep_state(client)
+        ep_world_size = int(state["ep_world_size"])
+        active_ep_size = int(state["active_ep_size"])
+        current_sleeping = [int(r) for r in state["sleeping_ep_ranks"]]
 
         if target_ep_size <= 0 or target_ep_size > ep_world_size:
             raise HTTPException(
@@ -90,12 +113,9 @@ async def flash_epscale(raw_request: Request):
             )
 
         if target_ep_size == active_ep_size:
-            step_start = time.perf_counter()
-            if set_active_dp_size is not None:
-                set_active_dp_size(target_ep_size)
-            timing_ms["route"] = elapsed_ms(step_start)
-            timing_ms["total"] = elapsed_ms(total_start)
-            logger.info("flash_epscale noop timing_ms=%s", timing_ms)
+            client.set_active_data_parallel_size(target_ep_size)
+            timing["total"] = _elapsed_ms(total_start)
+            logger.info("flash_epscale noop timing_ms=%s", timing)
             return JSONResponse(
                 content={
                     "ok": True,
@@ -105,195 +125,159 @@ async def flash_epscale(raw_request: Request):
                     "changed": False,
                     "action": "noop",
                     "tags": tags,
-                    "timing_ms": timing_ms,
+                    "timing_ms": timing,
                 }
             )
 
         target_sleeping = list(range(target_ep_size, ep_world_size))
-        paused = False
 
         if target_ep_size < active_ep_size:
             action = "scale_down"
-            try:
-                step_start = time.perf_counter()
-                if set_active_dp_size is not None:
-                    set_active_dp_size(target_ep_size)
-                timing_ms["route_shrink"] = elapsed_ms(step_start)
-                if wait_for_dp_drain is not None:
-                    step_start = time.perf_counter()
-                    await wait_for_dp_drain(target_sleeping, drain_timeout)
-                    timing_ms["drain"] = elapsed_ms(step_start)
-            except Exception as e:
-                step_start = time.perf_counter()
-                if set_active_dp_size is not None:
-                    set_active_dp_size(active_ep_size)
-                timing_ms["route_restore"] = elapsed_ms(step_start)
-                timing_ms["total"] = elapsed_ms(total_start)
-                logger.exception(
-                    "flash_epscale scale_down drain failed timing_ms=%s",
-                    timing_ms,
-                )
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"flash_epscale scale_down drain failed: {e}",
-                ) from e
-
-            try:
-                if pause_generation is not None:
-                    step_start = time.perf_counter()
-                    await pause_generation(mode="wait", clear_cache=False)
-                    paused = True
-                    timing_ms["pause"] = elapsed_ms(step_start)
-                if current_sleeping:
-                    step_start = time.perf_counter()
-                    await client.collective_rpc(
-                        "wake_up_ep_ranks",
-                        kwargs={
-                            "sleeping_ep_ranks": current_sleeping,
-                            "tags": tags,
-                        },
-                    )
-                    timing_ms["wake"] = elapsed_ms(step_start)
-                step_start = time.perf_counter()
-                await client.collective_rpc(
-                    "resize_sleep_ep_ranks",
-                    kwargs={"sleeping_ep_ranks": target_sleeping},
-                )
-                timing_ms["resize"] = elapsed_ms(step_start)
-                step_start = time.perf_counter()
-                await client.collective_rpc(
-                    "sleep_ep_ranks_by_tags",
-                    kwargs={
-                        "sleeping_ep_ranks": target_sleeping,
-                        "tags": tags,
-                    },
-                )
-                timing_ms["sleep"] = elapsed_ms(step_start)
-            except Exception as e:
-                timing_ms["total"] = elapsed_ms(total_start)
-                logger.exception("flash_epscale scale_down failed")
-                if paused and resume_generation is not None:
-                    try:
-                        step_start = time.perf_counter()
-                        await resume_generation()
-                        timing_ms["resume_after_error"] = elapsed_ms(step_start)
-                    except Exception:
-                        logger.exception("flash_epscale scale_down resume failed")
-                logger.error("flash_epscale scale_down failed timing_ms=%s", timing_ms)
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"flash_epscale scale_down failed: {e}",
-                ) from e
+            await _scale_down(
+                client,
+                target_ep_size=target_ep_size,
+                active_ep_size=active_ep_size,
+                target_sleeping=target_sleeping,
+                current_sleeping=current_sleeping,
+                tags=tags,
+                drain_timeout=drain_timeout,
+                timing=timing,
+            )
         else:
             action = "scale_up"
-            try:
-                if pause_generation is not None:
-                    step_start = time.perf_counter()
-                    await pause_generation(mode="wait", clear_cache=False)
-                    paused = True
-                    timing_ms["pause"] = elapsed_ms(step_start)
-                if current_sleeping:
-                    step_start = time.perf_counter()
-                    await client.collective_rpc(
-                        "wake_up_ep_ranks",
-                        kwargs={
-                            "sleeping_ep_ranks": current_sleeping,
-                            "tags": tags,
-                        },
-                    )
-                    timing_ms["wake"] = elapsed_ms(step_start)
-                step_start = time.perf_counter()
-                await client.collective_rpc(
-                    "resize_sleep_ep_ranks",
-                    kwargs={"sleeping_ep_ranks": target_sleeping},
-                )
-                timing_ms["resize"] = elapsed_ms(step_start)
-                if target_sleeping:
-                    step_start = time.perf_counter()
-                    await client.collective_rpc(
-                        "sleep_ep_ranks_by_tags",
-                        kwargs={
-                            "sleeping_ep_ranks": target_sleeping,
-                            "tags": tags,
-                        },
-                    )
-                    timing_ms["sleep"] = elapsed_ms(step_start)
-            except Exception as e:
-                if current_sleeping:
-                    try:
-                        await client.collective_rpc(
-                            "sleep_ep_ranks_by_tags",
-                            kwargs={
-                                "sleeping_ep_ranks": current_sleeping,
-                                "tags": tags,
-                            },
-                        )
-                    except Exception:
-                        logger.exception("flash_epscale scale_up rollback sleep failed")
-                if paused and resume_generation is not None:
-                    try:
-                        step_start = time.perf_counter()
-                        await resume_generation()
-                        timing_ms["resume_after_error"] = elapsed_ms(step_start)
-                    except Exception:
-                        logger.exception("flash_epscale scale_up resume failed")
-                timing_ms["total"] = elapsed_ms(total_start)
-                logger.exception(
-                    "flash_epscale scale_up failed timing_ms=%s", timing_ms
-                )
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"flash_epscale scale_up failed: {e}",
-                ) from e
+            await _scale_up(
+                client,
+                target_ep_size=target_ep_size,
+                target_sleeping=target_sleeping,
+                current_sleeping=current_sleeping,
+                tags=tags,
+                timing=timing,
+            )
 
-        step_start = time.perf_counter()
-        final_state = await _get_consistent_ep_sleep_state(client)
-        timing_ms["final_state"] = elapsed_ms(step_start)
-        final_active_ep_size = int(final_state["active_ep_size"])
-        final_sleeping = [int(rank) for rank in final_state["sleeping_ep_ranks"]]
-        if final_active_ep_size != target_ep_size or final_sleeping != target_sleeping:
-            if paused and resume_generation is not None:
-                try:
-                    step_start = time.perf_counter()
-                    await resume_generation()
-                    timing_ms["resume_after_error"] = elapsed_ms(step_start)
-                except Exception:
-                    logger.exception("flash_epscale final-state resume failed")
-            timing_ms["total"] = elapsed_ms(total_start)
-            logger.error("flash_epscale final state mismatch timing_ms=%s", timing_ms)
+        async with _timed(timing, "final_state"):
+            final = await _query_ep_state(client)
+        final_active = int(final["active_ep_size"])
+        final_sleeping = [int(r) for r in final["sleeping_ep_ranks"]]
+        if final_active != target_ep_size or final_sleeping != target_sleeping:
+            timing["total"] = _elapsed_ms(total_start)
+            logger.error("flash_epscale final state mismatch timing_ms=%s", timing)
             raise HTTPException(
                 status_code=500,
                 detail=(
                     "flash_epscale finished with unexpected EP sleep state: "
                     f"expected active_ep_size={target_ep_size}, "
                     f"sleeping_ep_ranks={target_sleeping}, got "
-                    f"active_ep_size={final_active_ep_size}, "
+                    f"active_ep_size={final_active}, "
                     f"sleeping_ep_ranks={final_sleeping}"
                 ),
             )
-        step_start = time.perf_counter()
-        if set_active_dp_size is not None:
-            set_active_dp_size(target_ep_size)
-        timing_ms["route_final"] = elapsed_ms(step_start)
-        if paused and resume_generation is not None:
-            step_start = time.perf_counter()
-            await resume_generation()
-            timing_ms["resume"] = elapsed_ms(step_start)
-        timing_ms["total"] = elapsed_ms(total_start)
-        logger.info("flash_epscale %s timing_ms=%s", action, timing_ms)
 
+        timing["total"] = _elapsed_ms(total_start)
+        logger.info("flash_epscale %s timing_ms=%s", action, timing)
         return JSONResponse(
             content={
                 "ok": True,
                 "ep_world_size": ep_world_size,
-                "active_ep_size": final_active_ep_size,
+                "active_ep_size": final_active,
                 "sleeping_ep_ranks": final_sleeping,
                 "changed": True,
                 "action": action,
                 "tags": tags,
-                "timing_ms": timing_ms,
+                "timing_ms": timing,
             }
         )
+
+
+async def _scale_down(
+    client: EngineClient,
+    *,
+    target_ep_size: int,
+    active_ep_size: int,
+    target_sleeping: list[int],
+    current_sleeping: list[int],
+    tags: list[str],
+    drain_timeout: float,
+    timing: dict[str, float],
+) -> None:
+    """Shrink the active EP set.
+
+    Active ranks keep serving while the soon-to-sleep ranks drain.  Only the
+    NCCL split / EPLB remap / sleep RPCs run inside the pause window.
+    """
+    # 1. Stop routing to the ranks that will sleep; they finish in flight.
+    #    Active ranks are unaffected.
+    try:
+        async with _timed(timing, "route_shrink"):
+            client.set_active_data_parallel_size(target_ep_size)
+        async with _timed(timing, "drain"):
+            await client.wait_for_dp_ranks_to_drain(target_sleeping, drain_timeout)
+    except Exception as e:
+        # Restore routing so requests are not stranded.
+        try:
+            client.set_active_data_parallel_size(active_ep_size)
+        except Exception:
+            logger.exception("flash_epscale scale_down route restore failed")
+        logger.exception("flash_epscale scale_down drain failed")
+        raise HTTPException(
+            status_code=500, detail=f"flash_epscale scale_down drain failed: {e}"
+        ) from e
+
+    # 2. Stop-the-world only for the steps that require global quiescence.
+    async with _paused(client, timing):
+        if current_sleeping:
+            async with _timed(timing, "wake"):
+                await client.collective_rpc(
+                    "wake_up_ep_ranks",
+                    kwargs={"sleeping_ep_ranks": current_sleeping, "tags": tags},
+                )
+        async with _timed(timing, "resize"):
+            await client.collective_rpc(
+                "resize_sleep_ep_ranks",
+                kwargs={"sleeping_ep_ranks": target_sleeping},
+            )
+        async with _timed(timing, "sleep"):
+            await client.collective_rpc(
+                "sleep_ep_ranks_by_tags",
+                kwargs={"sleeping_ep_ranks": target_sleeping, "tags": tags},
+            )
+
+
+async def _scale_up(
+    client: EngineClient,
+    *,
+    target_ep_size: int,
+    target_sleeping: list[int],
+    current_sleeping: list[int],
+    tags: list[str],
+    timing: dict[str, float],
+) -> None:
+    """Grow the active EP set.
+
+    Routing is opened to the new ranks only after the NCCL group is resized
+    and they are awake, so requests never reach a rank that is not ready.
+    """
+    async with _paused(client, timing):
+        if current_sleeping:
+            async with _timed(timing, "wake"):
+                await client.collective_rpc(
+                    "wake_up_ep_ranks",
+                    kwargs={"sleeping_ep_ranks": current_sleeping, "tags": tags},
+                )
+        async with _timed(timing, "resize"):
+            await client.collective_rpc(
+                "resize_sleep_ep_ranks",
+                kwargs={"sleeping_ep_ranks": target_sleeping},
+            )
+        if target_sleeping:
+            async with _timed(timing, "sleep"):
+                await client.collective_rpc(
+                    "sleep_ep_ranks_by_tags",
+                    kwargs={"sleeping_ep_ranks": target_sleeping, "tags": tags},
+                )
+
+    # Open routing to the newly active ranks only after the group is ready.
+    async with _timed(timing, "route_grow"):
+        client.set_active_data_parallel_size(target_ep_size)
 
 
 def attach_router(app: FastAPI):
